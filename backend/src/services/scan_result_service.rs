@@ -1182,9 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_stuck_scans_returns_database_error_on_connection_failure() {
         let service = ScanResultService::new(unreachable_pool());
-        let result = service
-            .cleanup_stuck_scans(Duration::from_secs(1800))
-            .await;
+        let result = service.cleanup_stuck_scans(Duration::from_secs(1800)).await;
         assert!(matches!(result, Err(AppError::Database(_))));
     }
 
