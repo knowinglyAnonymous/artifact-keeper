@@ -102,6 +102,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     doc.merge(super::handlers::health::HealthApiDoc::openapi());
     doc.merge(super::handlers::plugins::PluginsApiDoc::openapi());
     doc.merge(super::handlers::webhooks::WebhooksApiDoc::openapi());
+    doc.merge(super::handlers::email_subscriptions::EmailSubscriptionsApiDoc::openapi());
     doc.merge(super::handlers::signing::SigningApiDoc::openapi());
     doc.merge(super::handlers::security::SecurityApiDoc::openapi());
     doc.merge(super::handlers::sbom::SbomApiDoc::openapi());

@@ -141,6 +141,33 @@ pub fn build_email_body_text(event: &DomainEvent) -> String {
     )
 }
 
+/// HTML-escape the basic XSS-active characters so untrusted event fields
+/// (artifact paths from arbitrary uploads, actor display names from
+/// OIDC IdPs, entity IDs that may carry user-controlled bytes) cannot
+/// inject markup or script into the rendered email body.
+///
+/// Targets the four characters whose unescaped presence causes content
+/// to be parsed as markup rather than text: `&`, `<`, `>`, `"`. Trailing
+/// HTML tokens (`/`, single quotes) are NOT escaped because they only
+/// matter inside attribute values, and this builder never interpolates
+/// into attributes.
+///
+/// Fix for #920 security review M2 (stored-XSS-in-email via event
+/// fields rendered by Gmail / Outlook web clients).
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Build the HTML body for an event notification email.
 pub fn build_email_body_html(event: &DomainEvent) -> String {
     format!(
@@ -149,10 +176,10 @@ pub fn build_email_body_html(event: &DomainEvent) -> String {
          <p><strong>Entity:</strong> {}</p>\
          <p><strong>Actor:</strong> {}</p>\
          <p><strong>Time:</strong> {}</p>",
-        event.event_type,
-        event.entity_id,
-        event.actor.as_deref().unwrap_or("system"),
-        event.timestamp,
+        html_escape(&event.event_type),
+        html_escape(&event.entity_id),
+        html_escape(event.actor.as_deref().unwrap_or("system")),
+        html_escape(&event.timestamp.to_string()),
     )
 }
 
@@ -348,6 +375,65 @@ mod tests {
         let event = sample_event();
         let html = build_email_body_html(&event);
         assert!(html.contains("550e8400-e29b-41d4-a716-446655440000"));
+    }
+
+    // -----------------------------------------------------------------------
+    // html_escape: stored-XSS-in-email mitigation (#920 security review M2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_html_escape_replaces_xss_active_chars() {
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("\""), "&quot;");
+    }
+
+    #[test]
+    fn test_html_escape_passes_safe_chars_unchanged() {
+        assert_eq!(html_escape(""), "");
+        assert_eq!(html_escape("plain text"), "plain text");
+        assert_eq!(
+            html_escape("artifact-keeper/foo:v1.2.3"),
+            "artifact-keeper/foo:v1.2.3"
+        );
+    }
+
+    #[test]
+    fn test_html_escape_disarms_script_tag() {
+        // A hostile actor display name from a compromised OIDC IdP.
+        let raw = "<script>alert('xss')</script>";
+        let escaped = html_escape(raw);
+        assert!(
+            !escaped.contains("<script>"),
+            "raw <script> must not survive escaping; got {:?}",
+            escaped
+        );
+        assert!(escaped.starts_with("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn test_build_email_body_html_escapes_actor_field() {
+        let mut event = sample_event();
+        event.actor = Some("<img src=x onerror=alert(1)>".to_string());
+        let html = build_email_body_html(&event);
+        assert!(
+            !html.contains("<img src=x"),
+            "raw <img> tag survived render; XSS vector open. body: {}",
+            html
+        );
+        assert!(html.contains("&lt;img src=x"));
+    }
+
+    #[test]
+    fn test_build_email_body_html_escapes_entity_field() {
+        let mut event = sample_event();
+        event.entity_id = "</p><h1>injected</h1>".to_string();
+        let html = build_email_body_html(&event);
+        assert!(
+            !html.contains("</p><h1>injected"),
+            "raw markup in entity_id survived render; XSS vector open"
+        );
     }
 
     // -----------------------------------------------------------------------

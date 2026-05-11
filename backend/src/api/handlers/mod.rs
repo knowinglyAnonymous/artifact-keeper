@@ -108,6 +108,7 @@ pub mod cran;
 pub mod curation;
 pub mod debian;
 pub mod dependency_track;
+pub mod email_subscriptions;
 pub mod events;
 pub mod general;
 pub mod gitlfs;
