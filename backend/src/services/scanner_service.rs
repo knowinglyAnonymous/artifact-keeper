@@ -75,6 +75,33 @@ fn format_to_purl_type(format: &str) -> &'static str {
     }
 }
 
+/// SQL CTE that pins each `(artifact_id, scan_type)` pair to its single most-
+/// recently-completed scan_result row. Bind `$1 = artifact_id` and follow
+/// with `SELECT ... FROM <table> WHERE <table>.scan_result_id IN
+/// (SELECT id FROM latest_scans)`.
+///
+/// Shared across the SBOM read path (`extract_dependencies_for_artifact` in
+/// `api::handlers::sbom`) and the Dependency-Track submission path
+/// (`submit_sbom_to_dependency_track` below) so a rescan that removed a dep
+/// stops surfacing the removed dep from either surface. Mirror of the
+/// pattern already used by `recalculate_score` and `get_dashboard_summary`
+/// for vulnerability aggregation (issues #962 / #1126 / #1136).
+///
+/// Soft-deleted artifacts are excluded so consumers cannot rehydrate dep
+/// trees for content the operator retired (#903 fresh-eyes review #5).
+pub(crate) const LATEST_SCANS_FOR_ARTIFACT_CTE: &str = "
+WITH latest_scans AS (
+    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
+    FROM scan_results sr
+    JOIN artifacts a ON a.id = sr.artifact_id
+    WHERE sr.artifact_id = $1
+      AND NOT a.is_deleted
+      AND sr.status = 'completed'
+    ORDER BY sr.artifact_id, sr.scan_type,
+             sr.completed_at DESC NULLS LAST, sr.created_at DESC
+)
+";
+
 /// Derive the Dependency-Track project name and purl type from an optional
 /// repo name and format. When the repo row is missing, falls back to the
 /// raw repository UUID string.
@@ -2214,29 +2241,22 @@ impl ScannerService {
         // /sbom handler in `extract_dependencies_for_artifact`. Without
         // that window, an artifact rescanned after a dep removal would
         // still ship the removed dep to DT forever.
+        let package_sql = format!(
+            "{}
+            SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
+            FROM scan_packages sp
+            WHERE sp.scan_result_id IN (SELECT id FROM latest_scans)
+              AND sp.name IS NOT NULL
+              AND sp.name != ''",
+            LATEST_SCANS_FOR_ARTIFACT_CTE,
+        );
         #[allow(clippy::type_complexity)]
         let package_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                r#"
-                WITH latest_scans AS (
-                    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-                    FROM scan_results sr
-                    WHERE sr.artifact_id = $1
-                      AND sr.status = 'completed'
-                    ORDER BY sr.artifact_id, sr.scan_type,
-                             sr.completed_at DESC NULLS LAST, sr.created_at DESC
-                )
-                SELECT DISTINCT sp.name, sp.version, sp.purl, sp.license
-                FROM scan_packages sp
-                WHERE sp.scan_result_id IN (SELECT id FROM latest_scans)
-                  AND sp.name IS NOT NULL
-                  AND sp.name != ''
-                "#,
-            )
-            .bind(artifact.id)
-            .fetch_all(&self.db)
-            .await
-            .unwrap_or_default();
+            sqlx::query_as(&package_sql)
+                .bind(artifact.id)
+                .fetch_all(&self.db)
+                .await
+                .unwrap_or_default();
 
         let mut deps = build_dependency_info_from_packages(package_rows, purl_type);
 
@@ -2244,27 +2264,21 @@ impl ScannerService {
         // existed only have scan_findings rows. Same DISTINCT ON window so the
         // CVE-only component list matches the latest scan, not stale history.
         if deps.is_empty() {
-            let findings_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-                r#"
-                WITH latest_scans AS (
-                    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type) sr.id
-                    FROM scan_results sr
-                    WHERE sr.artifact_id = $1
-                      AND sr.status = 'completed'
-                    ORDER BY sr.artifact_id, sr.scan_type,
-                             sr.completed_at DESC NULLS LAST, sr.created_at DESC
-                )
+            let findings_sql = format!(
+                "{}
                 SELECT DISTINCT f.affected_component, f.affected_version, f.source
                 FROM scan_findings f
                 WHERE f.scan_result_id IN (SELECT id FROM latest_scans)
                   AND f.affected_component IS NOT NULL
-                  AND f.affected_component != ''
-                "#,
-            )
-            .bind(artifact.id)
-            .fetch_all(&self.db)
-            .await
-            .unwrap_or_default();
+                  AND f.affected_component != ''",
+                LATEST_SCANS_FOR_ARTIFACT_CTE,
+            );
+            let findings_rows: Vec<(String, Option<String>, Option<String>)> =
+                sqlx::query_as(&findings_sql)
+                    .bind(artifact.id)
+                    .fetch_all(&self.db)
+                    .await
+                    .unwrap_or_default();
 
             deps = build_dependency_info_from_findings(findings_rows, purl_type);
         }
