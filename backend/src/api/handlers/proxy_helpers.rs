@@ -198,6 +198,14 @@ fn map_proxy_error(repo_key: &str, path: &str, e: crate::error::AppError) -> Res
 /// Attempt to fetch an artifact from the upstream via the proxy service.
 /// Constructs a minimal `Repository` model from handler-level repo info.
 /// Returns `(content_bytes, content_type)` on success.
+///
+/// **Prefer [`proxy_fetch_streaming`] for large bodies (.deb, .jar, .apk,
+/// container blobs, LFS objects).** This buffered variant should only be
+/// used when the handler needs to inspect or transform the body in-process
+/// before responding to the client — examples include virtual-repo
+/// aggregation, JSON metadata rewriting, and content sniffing. Buffering
+/// large bodies on a memory-constrained pod (e.g. 1 GiB Kubernetes
+/// limit) causes the OOM kills described in #737 / #895.
 pub async fn proxy_fetch(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -223,12 +231,24 @@ pub async fn proxy_fetch(
 /// .whl) should prefer this over [`proxy_fetch`]. Handlers that fetch
 /// small metadata indices (Packages.gz, package.json, etc.) can keep
 /// using the buffered path.
+///
+/// `default_content_type` is the value used for the outbound
+/// `Content-Type` header when the upstream response does not carry one
+/// (cache hit with empty metadata OR upstream omits the header).
+/// Format handlers must supply a value matching client expectations —
+/// e.g. Maven `.pom` files need `text/xml`, Go module `.zip` needs
+/// `application/zip`, generic binaries get `application/octet-stream`.
+/// The buffered [`proxy_fetch`] path historically fell back to format-
+/// specific defaults inside each handler; this parameter preserves that
+/// behaviour without requiring callers to construct the response builder
+/// themselves.
 pub async fn proxy_fetch_streaming(
     proxy_service: &ProxyService,
     repo_id: Uuid,
     repo_key: &str,
     upstream_url: &str,
     path: &str,
+    default_content_type: &str,
 ) -> Result<Response, Response> {
     let repo = build_remote_repo(repo_id, repo_key, upstream_url);
     let result = proxy_service
@@ -241,7 +261,7 @@ pub async fn proxy_fetch_streaming(
         result
             .content_type
             .as_deref()
-            .unwrap_or("application/octet-stream"),
+            .unwrap_or(default_content_type),
     );
     if let Some(len) = result.content_length {
         builder = builder.header("content-length", len);

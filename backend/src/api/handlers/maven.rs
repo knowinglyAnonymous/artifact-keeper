@@ -1128,16 +1128,16 @@ async fn serve_artifact(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
-                    // #895: streaming variant so .jar/.war/.aar bodies do
-                    // not buffer in memory. Maven artifacts often run
-                    // 50-500 MB; under concurrent load the buffered path
-                    // OOMs 1 GiB pods.
+                    // #895: stream large bodies; pass content_type_for_path
+                    // so .pom -> text/xml, .jar -> application/java-archive
+                    // when upstream omits Content-Type (closes review N2).
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         repo_key,
                         upstream_url,
                         path,
+                        content_type_for_path(path),
                     )
                     .await;
                 }

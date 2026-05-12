@@ -723,14 +723,17 @@ async fn download_zip(
                 {
                     let encoded = encode_module_path(module);
                     let upstream_path = format!("{}/@v/{}.zip", encoded, version);
-                    // #895: streaming variant so Go module .zip bodies do
-                    // not buffer in memory. Large modules can exceed 100 MB.
+                    // #895: stream large module .zip; default Content-Type
+                    // matches the buffered handler's prior fallback so the
+                    // Go toolchain still sees `application/zip` when
+                    // upstream omits the header (review N2).
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo.key,
                         upstream_url,
                         &upstream_path,
+                        "application/zip",
                     )
                     .await;
                 }

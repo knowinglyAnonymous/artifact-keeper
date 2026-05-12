@@ -591,15 +591,16 @@ async fn download_object(
                     (&repo.upstream_url, &state.proxy_service)
                 {
                     let upstream_path = format!("objects/{}", oid);
-                    // #895: streaming variant — LFS blobs are by definition
-                    // large binary objects (the whole reason LFS exists);
-                    // buffering them on a 1 GiB pod OOMs immediately.
+                    // #895: stream large LFS blobs (the whole reason LFS
+                    // exists). Default Content-Type matches the buffered
+                    // handler's prior fallback.
                     return proxy_helpers::proxy_fetch_streaming(
                         proxy,
                         repo.id,
                         &repo_key,
                         upstream_url,
                         &upstream_path,
+                        "application/octet-stream",
                     )
                     .await;
                 }
