@@ -484,7 +484,7 @@ impl<'a> DebianProxy<'a> {
             _ => return Ok(()),
         };
 
-        let pseudo_repo = build_pseudo_remote(repo.id, self.repo_key, upstream_url);
+        let pseudo_repo = proxy_helpers::build_remote_repo(repo.id, self.repo_key, upstream_url);
         let (content, upstream_ct, changed) = proxy
             .fetch_dists_detecting_change(&pseudo_repo, &upstream_path)
             .await
@@ -580,7 +580,7 @@ async fn try_virtual_dists_detecting_change(
         let Some(upstream_url) = member.upstream_url.as_deref() else {
             continue;
         };
-        let pseudo_repo = build_pseudo_remote(member.id, &member.key, upstream_url);
+        let pseudo_repo = proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
         match proxy
             .fetch_dists_detecting_change(&pseudo_repo, upstream_path)
             .await
@@ -609,43 +609,6 @@ async fn try_virtual_dists_detecting_change(
         }
     }
     Ok(None)
-}
-
-/// Build a minimal `Repository` value suitable for
-/// `ProxyService::fetch_dists_detecting_change`, which only needs `id`,
-/// `key`, `repo_type`, and `upstream_url`.
-fn build_pseudo_remote(
-    id: uuid::Uuid,
-    repo_key: &str,
-    upstream_url: &str,
-) -> crate::models::repository::Repository {
-    use crate::models::repository::{
-        ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
-    };
-    Repository {
-        id,
-        key: repo_key.to_string(),
-        name: repo_key.to_string(),
-        description: None,
-        format: RepositoryFormat::Debian,
-        repo_type: RepositoryType::Remote,
-        storage_backend: "filesystem".to_string(),
-        storage_path: String::new(),
-        upstream_url: Some(upstream_url.to_string()),
-        is_public: false,
-        quota_bytes: None,
-        replication_priority: ReplicationPriority::OnDemand,
-        promotion_target_id: None,
-        promotion_policy_id: None,
-        curation_enabled: false,
-        curation_source_repo_id: None,
-        curation_target_repo_id: None,
-        curation_default_action: "allow".to_string(),
-        curation_sync_interval_secs: 0,
-        curation_auto_fetch: false,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    }
 }
 
 fn map_proxy_err(e: crate::error::AppError) -> Response {

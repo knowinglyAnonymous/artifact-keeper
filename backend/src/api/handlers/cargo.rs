@@ -1459,9 +1459,8 @@ mod tests {
         // Local member already contributed serde 1.0.0; the upstream's
         // serde 1.0.0 line must not overwrite it. Higher-priority
         // member's `cksum` is preserved.
-        let mut aggregated: Vec<String> = vec![
-            r#"{"name":"serde","vers":"1.0.0","cksum":"LOCAL"}"#.to_string()
-        ];
+        let mut aggregated: Vec<String> =
+            vec![r#"{"name":"serde","vers":"1.0.0","cksum":"LOCAL"}"#.to_string()];
         let mut seen: std::collections::HashSet<String> =
             ["1.0.0".to_string()].into_iter().collect();
         let upstream = b"{\"name\":\"serde\",\"vers\":\"1.0.0\",\"cksum\":\"UPSTREAM\"}\n{\"name\":\"serde\",\"vers\":\"1.0.1\",\"cksum\":\"UPSTREAM\"}";
