@@ -680,18 +680,18 @@ async fn try_proxy_apk(
         _ => return Ok(None),
     };
     let upstream_path = format!("{}/{}/{}/{}", branch, repository, arch, filename);
-    let (content, content_type) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, repo_key, upstream_url, &upstream_path).await?;
-    Ok(Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                "Content-Type",
-                content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
-            )
-            .body(Body::from(content))
-            .unwrap(),
-    ))
+    // #895: streaming variant — .apk packages are the large-body payload
+    // here (a few MiB up to ~100 MiB for fat Alpine packages like LLVM
+    // toolchains); buffering wastes pod memory and starves the client.
+    let response = proxy_helpers::proxy_fetch_streaming(
+        proxy,
+        repo.id,
+        repo_key,
+        upstream_url,
+        &upstream_path,
+    )
+    .await?;
+    Ok(Some(response))
 }
 
 // ---------------------------------------------------------------------------
