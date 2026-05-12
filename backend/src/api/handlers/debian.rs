@@ -429,15 +429,7 @@ impl<'a> DebianProxy<'a> {
         let (content, upstream_ct) =
             proxy_helpers::proxy_fetch(proxy, repo.id, self.repo_key, upstream_url, &upstream_path)
                 .await?;
-        Err(Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                CONTENT_TYPE,
-                upstream_ct.unwrap_or_else(|| content_type.to_string()),
-            )
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap())
+        Err(build_dists_response(content, upstream_ct, content_type))
     }
 
     /// Variant of `dists` that also detects whether the upstream content
@@ -490,24 +482,58 @@ impl<'a> DebianProxy<'a> {
             .await
             .map_err(map_proxy_err)?;
 
-        if changed {
-            if let Ok(text) = std::str::from_utf8(&content) {
-                proxy
-                    .invalidate_dist_packages_cache(self.repo_key, self.distribution, text)
-                    .await;
-            }
+        if let Some(text) = release_invalidation_payload(changed, &content) {
+            proxy
+                .invalidate_dist_packages_cache(self.repo_key, self.distribution, text)
+                .await;
         }
 
-        Err(Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                CONTENT_TYPE,
-                upstream_ct.unwrap_or_else(|| content_type.to_string()),
-            )
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap())
+        Err(build_dists_response(content, upstream_ct, content_type))
     }
+}
+
+/// Pure helper that builds the HTTP response for a successful dists
+/// fetch (either through the direct-Remote path or after a Virtual
+/// member match). Extracted so the Content-Type fallback and length
+/// header construction can be exercised without async runtime or DB.
+fn build_dists_response(
+    content: Bytes,
+    upstream_ct: Option<String>,
+    default_content_type: &str,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            upstream_ct.unwrap_or_else(|| default_content_type.to_string()),
+        )
+        .header(CONTENT_LENGTH, content.len().to_string())
+        .body(Body::from(content))
+        .unwrap()
+}
+
+/// Pure helper that decides whether a Remote member should be tried
+/// for the current dists request. Returns the upstream URL when the
+/// member is eligible, `None` otherwise. Extracted so the
+/// member-filter predicate is unit-testable without DB access.
+fn remote_member_upstream(member: &crate::models::repository::Repository) -> Option<&str> {
+    if member.repo_type != RepositoryType::Remote {
+        return None;
+    }
+    member.upstream_url.as_deref()
+}
+
+/// Pure helper that decides whether an upstream Release body should
+/// trigger sibling-Packages cache invalidation (#1147). Returns the
+/// decoded UTF-8 body when the caller should invalidate, `None` when
+/// the body either didn't change or isn't valid UTF-8. Factoring this
+/// out makes the change-detection branch testable without a real
+/// proxy fetch.
+fn release_invalidation_payload(changed: bool, content: &[u8]) -> Option<&str> {
+    if !changed {
+        return None;
+    }
+    std::str::from_utf8(content).ok()
 }
 
 /// Iterate the virtual repo's Remote members for `upstream_path` and
@@ -525,27 +551,18 @@ async fn try_virtual_dists(
         return Ok(None);
     };
     for member in &members {
-        if member.repo_type != RepositoryType::Remote {
-            continue;
-        }
-        let Some(upstream_url) = member.upstream_url.as_deref() else {
+        let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
         match proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, upstream_path)
             .await
         {
             Ok((content, upstream_ct)) => {
-                return Ok(Some(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            CONTENT_TYPE,
-                            upstream_ct.unwrap_or_else(|| default_content_type.to_string()),
-                        )
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .body(Body::from(content))
-                        .unwrap(),
-                ));
+                return Ok(Some(build_dists_response(
+                    content,
+                    upstream_ct,
+                    default_content_type,
+                )));
             }
             Err(_) => {
                 // Try the next member.
@@ -574,10 +591,7 @@ async fn try_virtual_dists_detecting_change(
         return Ok(None);
     };
     for member in &members {
-        if member.repo_type != RepositoryType::Remote {
-            continue;
-        }
-        let Some(upstream_url) = member.upstream_url.as_deref() else {
+        let Some(upstream_url) = remote_member_upstream(member) else {
             continue;
         };
         let pseudo_repo = proxy_helpers::build_remote_repo(member.id, &member.key, upstream_url);
@@ -586,24 +600,16 @@ async fn try_virtual_dists_detecting_change(
             .await
         {
             Ok((content, upstream_ct, changed)) => {
-                if changed {
-                    if let Ok(text) = std::str::from_utf8(&content) {
-                        proxy
-                            .invalidate_dist_packages_cache(&member.key, distribution, text)
-                            .await;
-                    }
+                if let Some(text) = release_invalidation_payload(changed, &content) {
+                    proxy
+                        .invalidate_dist_packages_cache(&member.key, distribution, text)
+                        .await;
                 }
-                return Ok(Some(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(
-                            CONTENT_TYPE,
-                            upstream_ct.unwrap_or_else(|| default_content_type.to_string()),
-                        )
-                        .header(CONTENT_LENGTH, content.len().to_string())
-                        .body(Body::from(content))
-                        .unwrap(),
-                ));
+                return Ok(Some(build_dists_response(
+                    content,
+                    upstream_ct,
+                    default_content_type,
+                )));
             }
             Err(_) => continue,
         }
@@ -1539,6 +1545,193 @@ mod tests {
         let err = crate::error::AppError::Internal("boom".to_string());
         let (status, _msg) = proxy_err_status_and_message(&err);
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_proxy_err wrapper (#1147)
+    //
+    // The wrapper is a one-liner over `proxy_err_status_and_message` plus
+    // `into_response()`, but its branches still count as changed lines.
+    // Exercising it here keeps the public surface covered.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_map_proxy_err_not_found_produces_404_response() {
+        let resp = map_proxy_err(crate::error::AppError::NotFound("missing".to_string()));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_map_proxy_err_other_errors_produce_502_response() {
+        let resp = map_proxy_err(crate::error::AppError::Storage("io".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let resp = map_proxy_err(crate::error::AppError::Validation("v".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let resp = map_proxy_err(crate::error::AppError::Internal("i".to_string()));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_dists_response (#1147)
+    //
+    // The pure response builder shared by the dists() / dists_detecting_change()
+    // / try_virtual_dists() / try_virtual_dists_detecting_change() paths.
+    // Verifies the Content-Type fallback and length header.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_dists_response_uses_upstream_content_type_when_present() {
+        let body = Bytes::from_static(b"Origin: Debian\n");
+        let resp = build_dists_response(
+            body.clone(),
+            Some("application/octet-stream".to_string()),
+            "text/plain; charset=utf-8",
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            headers
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            body.len().to_string()
+        );
+    }
+
+    #[test]
+    fn test_build_dists_response_falls_back_to_default_content_type() {
+        let body = Bytes::from_static(b"abc");
+        let resp = build_dists_response(body, None, "text/plain; charset=utf-8");
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn test_build_dists_response_empty_body_reports_zero_length() {
+        let resp = build_dists_response(Bytes::new(), None, "text/plain; charset=utf-8");
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("0")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // remote_member_upstream (#1147)
+    //
+    // Pure predicate used by the virtual dispatchers to decide whether to
+    // try a member. Covers each branch (non-Remote, Remote without URL,
+    // Remote with URL).
+    // -----------------------------------------------------------------------
+
+    fn test_member(
+        repo_type: RepositoryType,
+        upstream: Option<&str>,
+    ) -> crate::models::repository::Repository {
+        use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
+        Repository {
+            id: uuid::Uuid::new_v4(),
+            key: "m".to_string(),
+            name: "m".to_string(),
+            description: None,
+            format: RepositoryFormat::Debian,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/tmp/m".to_string(),
+            upstream_url: upstream.map(|s| s.to_string()),
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::LocalOnly,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 0,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_remote_member_upstream_skips_local_member() {
+        let m = test_member(RepositoryType::Local, Some("https://upstream.test"));
+        assert!(
+            remote_member_upstream(&m).is_none(),
+            "Local members never get proxied for dists"
+        );
+    }
+
+    #[test]
+    fn test_remote_member_upstream_skips_staging_member() {
+        let m = test_member(RepositoryType::Staging, Some("https://upstream.test"));
+        assert!(remote_member_upstream(&m).is_none());
+    }
+
+    #[test]
+    fn test_remote_member_upstream_skips_remote_without_url() {
+        let m = test_member(RepositoryType::Remote, None);
+        assert!(
+            remote_member_upstream(&m).is_none(),
+            "A Remote member with no upstream_url is a misconfiguration; \
+             skip rather than panic."
+        );
+    }
+
+    #[test]
+    fn test_remote_member_upstream_returns_url_for_valid_remote() {
+        let m = test_member(RepositoryType::Remote, Some("https://deb.debian.org"));
+        assert_eq!(remote_member_upstream(&m), Some("https://deb.debian.org"));
+    }
+
+    // -----------------------------------------------------------------------
+    // release_invalidation_payload (#1147)
+    //
+    // Pure helper that gates sibling-Packages cache invalidation on both
+    // the change flag AND UTF-8 decodability of the body.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_release_invalidation_payload_skips_when_unchanged() {
+        // Even a perfectly valid Release body must not trigger cache
+        // invalidation when the upstream content was identical to the
+        // cached copy. Otherwise apt-get update would needlessly
+        // churn sibling caches on every poll.
+        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
+        assert!(release_invalidation_payload(false, release).is_none());
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_returns_text_when_changed() {
+        let release = b"SHA256:\n abc 100 main/binary-amd64/Packages\n";
+        let got = release_invalidation_payload(true, release);
+        assert!(got.is_some());
+        assert!(got.unwrap().contains("main/binary-amd64/Packages"));
+    }
+
+    #[test]
+    fn test_release_invalidation_payload_skips_non_utf8_body() {
+        // A malicious or corrupted upstream that serves binary garbage
+        // under the `Release` URL must not crash the handler; the
+        // invalidation step is silently skipped.
+        let garbage: &[u8] = &[0xff, 0xfe, 0xfd, 0xfc];
+        assert!(release_invalidation_payload(true, garbage).is_none());
     }
 
     // -----------------------------------------------------------------------

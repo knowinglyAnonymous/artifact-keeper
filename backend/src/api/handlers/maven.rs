@@ -1965,6 +1965,34 @@ mod tests {
     }
 
     #[test]
+    fn test_build_updated_secondary_metadata_appends_when_new_file_has_no_path() {
+        // Defensive: a malformed `new_file` value without a `path` field
+        // must not panic. Dedupe is skipped and the entry is appended
+        // verbatim. Covers the "if let Some(ref np)" false branch.
+        let existing = Some(serde_json::json!({
+            "files": [make_file_json("p/demo-1.0.0.jar", "jar")],
+        }));
+        let coords = sample_coords();
+        let new_file = serde_json::json!({
+            // No "path" field at all.
+            "extension": "jar",
+            "storageKey": "maven/p/demo-1.0.0.jar",
+            "sizeBytes": 1,
+            "sha256": "x",
+        });
+        let updated = build_updated_secondary_metadata(
+            existing,
+            &coords,
+            "p/demo-1.0.0.jar",
+            new_file,
+            &serde_json::json!({}),
+        );
+        let files = updated["files"].as_array().unwrap();
+        // Both the original entry and the path-less new entry are kept.
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
     fn test_build_updated_secondary_metadata_dedupes_by_path() {
         // Re-upload of the same SNAPSHOT classifier replaces its prior
         // entry rather than accumulating duplicates.

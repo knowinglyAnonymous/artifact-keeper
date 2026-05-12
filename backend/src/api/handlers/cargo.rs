@@ -1108,6 +1108,7 @@ async fn try_remote_index(
 ///   the same `(name, vers)` appears in more than one member, the entry from
 ///   the higher-priority member (earlier in the iteration order) wins, which
 ///   matches the artifact-listing precedence used elsewhere.
+#[allow(clippy::result_large_err)]
 async fn try_virtual_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1185,10 +1186,8 @@ async fn try_virtual_index(
                     continue;
                 };
 
-                let base_url = index_url_overrides
-                    .get(&member.id)
-                    .cloned()
-                    .unwrap_or_else(|| upstream_url.clone());
+                let base_url =
+                    resolve_remote_index_base_url(&index_url_overrides, member.id, upstream_url);
 
                 if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch(
                     proxy,
@@ -1244,19 +1243,46 @@ async fn try_virtual_index(
         }
     }
 
+    finalize_virtual_index_aggregation(aggregated).map(|maybe_body| match maybe_body {
+        Ok(body) => {
+            index_cache_set(index_cache, cache_key.to_string(), body.clone());
+            Ok(index_response(body, Some("application/json".to_string())))
+        }
+        Err(resp) => Err(resp),
+    })
+}
+
+/// Pick the upstream base URL to use when fetching a virtual member's
+/// sparse-index NDJSON. An entry in `repository_config.index_upstream_url`
+/// overrides the member's primary `upstream_url`, so an admin can point
+/// e.g. a github.com Cargo registry at a separate index host without
+/// editing the artifact upstream. Pure to keep tested without DB.
+fn resolve_remote_index_base_url(
+    overrides: &HashMap<uuid::Uuid, String>,
+    member_id: uuid::Uuid,
+    fallback_upstream_url: &str,
+) -> String {
+    overrides
+        .get(&member_id)
+        .cloned()
+        .unwrap_or_else(|| fallback_upstream_url.to_string())
+}
+
+/// Decide what `try_virtual_index` should return given the aggregated
+/// NDJSON lines collected from every member. Returns `Some(Ok(body))`
+/// when there are entries to serve, `Some(Err(404 response))` when no
+/// member contributed anything. Returning `None` is reserved for the
+/// "skip the virtual path entirely" pre-check before aggregation; this
+/// helper does not produce it.
+#[allow(clippy::result_large_err)]
+fn finalize_virtual_index_aggregation(aggregated: Vec<String>) -> Option<Result<Bytes, Response>> {
     if aggregated.is_empty() {
         return Some(Err(AppError::NotFound(
             "Artifact not found in any member repository".to_string(),
         )
         .into_response()));
     }
-
-    let body = bytes::Bytes::from(aggregated.join("\n"));
-    index_cache_set(index_cache, cache_key.to_string(), body.clone());
-    Some(Ok(index_response(
-        body,
-        Some("application/json".to_string()),
-    )))
+    Some(Ok(Bytes::from(aggregated.join("\n"))))
 }
 
 /// Merge sparse-index NDJSON lines from one member into the running
@@ -1503,6 +1529,76 @@ mod tests {
         merge_index_lines(&bytes, &mut aggregated, &mut seen);
         assert!(aggregated.is_empty());
         assert!(seen.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_remote_index_base_url (#1143)
+    //
+    // Pure helper for the virtual-index Remote-member path: picks the
+    // `repository_config.index_upstream_url` override when present, else
+    // falls back to the member's primary `upstream_url`. Exercising it
+    // directly avoids spinning up a DB just to verify the precedence
+    // table.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_remote_index_base_url_uses_override_when_present() {
+        let id = uuid::Uuid::new_v4();
+        let mut overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        overrides.insert(id, "https://override.example/index".to_string());
+        let base = resolve_remote_index_base_url(&overrides, id, "https://upstream.example");
+        assert_eq!(base, "https://override.example/index");
+    }
+
+    #[test]
+    fn test_resolve_remote_index_base_url_falls_back_to_upstream_when_no_override() {
+        let id = uuid::Uuid::new_v4();
+        let overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        let base = resolve_remote_index_base_url(&overrides, id, "https://upstream.example");
+        assert_eq!(base, "https://upstream.example");
+    }
+
+    #[test]
+    fn test_resolve_remote_index_base_url_override_only_applies_to_matching_member() {
+        // Override is registered for *another* member's id; the current
+        // member should still get its primary upstream URL.
+        let target_id = uuid::Uuid::new_v4();
+        let other_id = uuid::Uuid::new_v4();
+        let mut overrides: HashMap<uuid::Uuid, String> = HashMap::new();
+        overrides.insert(other_id, "https://override.example/index".to_string());
+        let base = resolve_remote_index_base_url(&overrides, target_id, "https://upstream.example");
+        assert_eq!(base, "https://upstream.example");
+    }
+
+    // -----------------------------------------------------------------------
+    // finalize_virtual_index_aggregation (#1143)
+    //
+    // Decides between an aggregated NDJSON body and a 404 when no member
+    // contributed any line. The pre-cache step happens in the caller so
+    // this helper is purely a body-or-not-found decision.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_body_when_lines_present() {
+        let lines = vec![
+            r#"{"name":"foo","vers":"1.0.0"}"#.to_string(),
+            r#"{"name":"foo","vers":"1.0.1"}"#.to_string(),
+        ];
+        let out = finalize_virtual_index_aggregation(lines)
+            .expect("Some(_) when called from aggregation path");
+        let body = out.expect("Ok(body) when lines were aggregated");
+        // Lines are joined with `\n` (no trailing newline added).
+        let text = std::str::from_utf8(&body).expect("utf-8 NDJSON");
+        assert!(text.contains("1.0.0"));
+        assert!(text.contains("1.0.1"));
+        assert!(text.contains('\n'));
+    }
+
+    #[test]
+    fn test_finalize_virtual_index_aggregation_returns_404_when_empty() {
+        let out = finalize_virtual_index_aggregation(Vec::new()).expect("Some(_)");
+        let resp = out.expect_err("empty aggregation must surface as 404");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // -----------------------------------------------------------------------

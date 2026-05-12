@@ -621,14 +621,19 @@ async fn fetch_package_info_from_member(
     .unwrap_or(0);
 
     let json = build_package_info_json(virtual_repo_key, name, &release_rows, download_count);
+    Ok(Some(package_info_response(&json)))
+}
 
-    Ok(Some(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_string(&json).unwrap()))
-            .unwrap(),
-    ))
+/// Pure helper that serializes a hex `/packages/<name>` JSON value into
+/// the final HTTP response. Extracted from
+/// [`fetch_package_info_from_member`] so the Content-Type and status
+/// can be exercised without a database.
+fn package_info_response(json: &serde_json::Value) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(json).unwrap()))
+        .unwrap()
 }
 
 /// Build the `/hex/<repo>/packages/<name>` JSON payload from a list of
@@ -1017,6 +1022,52 @@ mod tests {
         let r = &json["releases"][0];
         assert_eq!(r["version"].as_str(), Some(""));
         assert_eq!(r["url"].as_str(), Some("/hex/v/tarballs/p-.tar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // package_info_response (#973)
+    //
+    // Pure helper that finalises a hex `/packages/<name>` JSON body into
+    // an HTTP response. Covers the JSON serialization + Content-Type
+    // wiring without needing a DB-backed handler call.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_package_info_response_uses_json_content_type() {
+        let json = build_package_info_json(
+            "v",
+            "p",
+            &[(Some("1.0.0".to_string()), "sha".to_string())],
+            7,
+        );
+        let resp = package_info_response(&json);
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_package_info_response_body_round_trips_through_serde_json() {
+        // The body must serialize the JSON value exactly (no extra
+        // wrapping). We collect the body bytes and re-parse, then
+        // assert structural equality on the round-tripped value.
+        let release_rows = vec![
+            (Some("1.0.0".to_string()), "sha-a".to_string()),
+            (Some("1.1.0".to_string()), "sha-b".to_string()),
+        ];
+        let json = build_package_info_json("hex-virt", "logger", &release_rows, 99);
+        let resp = package_info_response(&json);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(parsed["name"].as_str(), Some("logger"));
+        assert_eq!(parsed["downloads"].as_i64(), Some(99));
+        assert_eq!(parsed["releases"].as_array().map(|a| a.len()), Some(2));
     }
 
     #[test]

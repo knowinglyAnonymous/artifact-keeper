@@ -1511,17 +1511,31 @@ async fn load_maven_secondary_files(
             Err(_) => continue,
         };
         let meta: Option<serde_json::Value> = r.try_get("metadata").ok();
-        let files = meta
-            .as_ref()
-            .and_then(|m| m.get("files"))
-            .and_then(|f| f.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if !files.is_empty() {
+        if let Some(files) = extract_secondary_files_from_metadata(meta.as_ref()) {
             out.insert(id, files);
         }
     }
     out
+}
+
+/// Pure helper that pulls the `files` array out of an `artifact_metadata.metadata`
+/// JSON blob. Returns `None` when the row has no metadata, no `files` array,
+/// or an empty `files` array, so the caller can omit the artifact from its
+/// "has secondary files" lookup table. Extracted so the JSON-shape parsing
+/// is testable without hitting Postgres.
+fn extract_secondary_files_from_metadata(
+    metadata: Option<&serde_json::Value>,
+) -> Option<Vec<serde_json::Value>> {
+    let files = metadata
+        .and_then(|m| m.get("files"))
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if files.is_empty() {
+        None
+    } else {
+        Some(files)
+    }
 }
 
 /// Build a grouped-by-component response for Maven/Gradle repositories.
@@ -3223,6 +3237,57 @@ mod tests {
         let rows = expand_maven_secondary_files(&primary, "k", &secondary);
         assert_eq!(rows[0].size_bytes, 0);
         assert_eq!(rows[0].checksum_sha256, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_secondary_files_from_metadata (Maven secondary-file lookup, #1092)
+    //
+    // Pure helper that parses the `metadata` JSON column for the
+    // `files` array used by the per-artifact secondary-files map.
+    // Covers each branch of the parsing chain.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_secondary_files_returns_files_array_when_present() {
+        let meta = serde_json::json!({
+            "files": [
+                {"path": "p/demo.pom", "extension": "pom"},
+                {"path": "p/demo-sources.jar", "extension": "jar"},
+            ],
+        });
+        let out = extract_secondary_files_from_metadata(Some(&meta));
+        let files = out.expect("non-empty files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["path"].as_str(), Some("p/demo.pom"));
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_metadata_missing() {
+        // Artifact has no metadata row at all (Option::None).
+        assert!(extract_secondary_files_from_metadata(None).is_none());
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_files_key_absent() {
+        // Metadata blob exists but has no `files` key (older POMs that
+        // never accumulated a secondary-files list).
+        let meta = serde_json::json!({"groupId": "com.example"});
+        assert!(extract_secondary_files_from_metadata(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_files_is_empty_array() {
+        // Explicit empty list -- still nothing to expand.
+        let meta = serde_json::json!({"files": []});
+        assert!(extract_secondary_files_from_metadata(Some(&meta)).is_none());
+    }
+
+    #[test]
+    fn test_extract_secondary_files_returns_none_when_files_is_not_an_array() {
+        // Defensive against schema drift -- a non-array `files` value
+        // is treated as "no secondary files" rather than panicking.
+        let meta = serde_json::json!({"files": "not-an-array"});
+        assert!(extract_secondary_files_from_metadata(Some(&meta)).is_none());
     }
 
     // -----------------------------------------------------------------------

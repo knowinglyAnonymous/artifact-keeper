@@ -3294,6 +3294,221 @@ SHA256:
     }
 
     // -----------------------------------------------------------------------
+    // invalidate_cache_by_key + invalidate_dist_packages_cache (#1147)
+    //
+    // Direct unit coverage for the APT Release-coherence helpers extracted
+    // for the virtual-repo cross-format aggregation PR. Both helpers are
+    // storage-only (no DB), so they slot cleanly into a mock-storage test
+    // pattern that records every `delete(...)` call and asserts the
+    // helper hits the right keys.
+    // -----------------------------------------------------------------------
+
+    /// Recording mock that captures every `delete()` call so tests can
+    /// inspect exactly which cache keys an invalidation helper evicted.
+    /// All other operations are no-ops returning the obvious defaults.
+    struct DeleteRecordingStorage {
+        deletes: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl DeleteRecordingStorage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                deletes: tokio::sync::Mutex::new(Vec::new()),
+            })
+        }
+        async fn deletes_snapshot(&self) -> Vec<String> {
+            self.deletes.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::storage_service::StorageBackend for DeleteRecordingStorage {
+        async fn put(&self, _key: &str, _content: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get(&self, key: &str) -> Result<Bytes> {
+            Err(AppError::NotFound(key.to_string()))
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().await.push(key.to_string());
+            Ok(())
+        }
+        async fn list(&self, _prefix: Option<&str>) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn copy(&self, _source: &str, _dest: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn size(&self, _key: &str) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_by_key_deletes_both_content_and_metadata() {
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        service
+            .invalidate_cache_by_key("apt-debian", "dists/bookworm/Release")
+            .await
+            .expect("invalidate_cache_by_key");
+
+        let deletes = storage.deletes_snapshot().await;
+        // Helper must hit exactly two keys: the cached body and the
+        // metadata sidecar. The relative ordering matches the
+        // implementation but the test only asserts both are present.
+        assert_eq!(
+            deletes.len(),
+            2,
+            "expected delete of both content and metadata, got {:?}",
+            deletes
+        );
+        let any_meta = deletes.iter().any(|k| k.contains("__cache_meta__.json"));
+        assert!(
+            any_meta,
+            "metadata sidecar should be deleted: {:?}",
+            deletes
+        );
+        let any_content = deletes.iter().any(|k| !k.contains("__cache_meta__.json"));
+        assert!(
+            any_content,
+            "content key should be deleted (non-metadata key): {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_by_key_rejects_invalid_path() {
+        // Path-traversal attempts must surface as `Err` before any
+        // storage delete is issued, so a malicious upstream cannot use
+        // the helper to delete unrelated cache entries.
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let result = service
+            .invalidate_cache_by_key("apt-debian", "../etc/passwd")
+            .await;
+
+        // We don't care about the specific error variant, only that no
+        // delete fired. (cache_storage_key returns Err for traversal.)
+        assert!(result.is_err(), "traversal path should error");
+        let deletes = storage.deletes_snapshot().await;
+        assert!(
+            deletes.is_empty(),
+            "no delete should be issued on path-traversal: {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_dist_packages_cache_evicts_each_path() {
+        // Driven by the Release-file parser: every path under the
+        // `SHA256:` section must produce a paired
+        // `dists/<dist>/<relative>` invalidation. The helper itself is
+        // fire-and-forget (no return value), so we observe its side
+        // effects through the recording mock.
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let release = "\
+SHA256:
+ aaa 100 main/binary-amd64/Packages
+ bbb 200 main/binary-amd64/Packages.gz
+ ccc 300 main/binary-arm64/Packages
+";
+        service
+            .invalidate_dist_packages_cache("apt-debian", "bookworm", release)
+            .await;
+
+        let deletes = storage.deletes_snapshot().await;
+        // 3 referenced paths × (content + metadata) = 6 delete calls.
+        assert_eq!(
+            deletes.len(),
+            6,
+            "expected 3 paths × 2 keys (content+metadata) = 6 deletes, got {:?}",
+            deletes
+        );
+
+        // The dist prefix and each relative path must appear at least
+        // once across the recorded keys.
+        let joined = deletes.join("|");
+        assert!(
+            joined.contains("bookworm"),
+            "deletes should target the right dist: {:?}",
+            deletes
+        );
+        for rel in [
+            "main/binary-amd64/Packages",
+            "main/binary-amd64/Packages.gz",
+            "main/binary-arm64/Packages",
+        ] {
+            assert!(
+                deletes.iter().any(|k| k.contains(rel)),
+                "expected eviction of {} in {:?}",
+                rel,
+                deletes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_dist_packages_cache_empty_release_is_noop() {
+        // A Release file with no checksum section must produce zero
+        // delete calls so we don't churn the cache on degenerate input.
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        service
+            .invalidate_dist_packages_cache("apt-debian", "bookworm", "Origin: Debian\n")
+            .await;
+
+        let deletes = storage.deletes_snapshot().await;
+        assert!(
+            deletes.is_empty(),
+            "Release without SHA256 section must not invalidate anything: {:?}",
+            deletes
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_dist_packages_cache_skips_traversal_paths() {
+        // parse_release_file_paths drops `..` segments; the eviction
+        // helper inherits that protection so a hostile upstream can't
+        // aim invalidations at unrelated cache keys.
+        let storage = DeleteRecordingStorage::new();
+        let service = build_proxy_service_with_storage(storage.clone());
+
+        let release = "\
+SHA256:
+ abc 100 ../../etc/passwd
+ def 200 main/binary-amd64/Packages
+";
+        service
+            .invalidate_dist_packages_cache("apt-debian", "bookworm", release)
+            .await;
+
+        let deletes = storage.deletes_snapshot().await;
+        // Only the well-formed entry contributes: 1 path × 2 keys = 2.
+        assert_eq!(
+            deletes.len(),
+            2,
+            "traversal entry must be dropped, got {:?}",
+            deletes
+        );
+        for k in &deletes {
+            assert!(
+                !k.contains(".."),
+                "no delete should reference a traversal path: {:?}",
+                deletes
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // tee_upstream_to_cache (#895): proxy slow-path streaming
     //
     // The tee forwards each upstream chunk to BOTH the client stream and a
