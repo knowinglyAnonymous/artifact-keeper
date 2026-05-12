@@ -3223,6 +3223,136 @@ mod tests {
         );
     }
 
+    /// An error mid-upstream-stream must surface to the client AND
+    /// cause the storage writer to abandon the cache (no metadata
+    /// sidecar). Chunks delivered before the error are NOT promoted
+    /// to a "partial" cache: the writer task observes the upstream
+    /// error via the channel and put_stream returns Err, so the
+    /// metadata sidecar branch is skipped.
+    #[tokio::test]
+    async fn test_tee_upstream_error_mid_stream_aborts_cache() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from_static(b"first-chunk")),
+            Err(AppError::Storage("upstream connection reset".to_string())),
+        ]));
+
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+
+        // First chunk delivered normally.
+        let first = client.next().await.expect("first chunk").expect("ok");
+        assert_eq!(first.as_ref(), b"first-chunk");
+        // Second pull surfaces the upstream error.
+        match client.next().await {
+            Some(Err(_)) => {}
+            other => panic!(
+                "expected upstream error to surface to client; got Some/Err shape: {}",
+                other.is_some()
+            ),
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            backend.metadata_writes.lock().await.is_empty(),
+            "upstream error mid-stream MUST NOT leave a metadata sidecar"
+        );
+    }
+
+    /// Single-chunk upstream (small files served through the streaming
+    /// path) round-trips cleanly. Exercises the "EOF after first send"
+    /// branch separate from the many-chunk loop.
+    #[tokio::test]
+    async fn test_tee_single_chunk_round_trip() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"solo"]);
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template(),
+        );
+        let mut received = Vec::new();
+        while let Some(chunk) = client.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, b"solo");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stored: Vec<u8> = backend
+            .put_stream_chunks
+            .lock()
+            .await
+            .iter()
+            .flat_map(|b| b.to_vec())
+            .collect();
+        assert_eq!(stored, b"solo");
+    }
+
+    /// Pin the metadata sidecar shape: etag, content-type, and TTL
+    /// must round-trip through the writer task. Catches regressions
+    /// that drop fields between the template and the persisted JSON.
+    #[tokio::test]
+    async fn test_tee_metadata_sidecar_carries_etag_and_ttl() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+
+        let upstream = upstream_chunks(vec![b"payload"]);
+        let template = CacheMetadataTemplate {
+            content_type: Some("application/x-deb".to_string()),
+            etag: Some("\"abc123\"".to_string()),
+            ttl_secs: 7200,
+        };
+        let mut client = tee_upstream_to_cache(
+            upstream,
+            storage,
+            "cache-key".to_string(),
+            "meta-key".to_string(),
+            template,
+        );
+        while client.next().await.is_some() {}
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let writes = backend.metadata_writes.lock().await;
+        assert_eq!(writes.len(), 1);
+        let metadata: CacheMetadata = serde_json::from_slice(&writes[0].1).unwrap();
+        assert_eq!(metadata.content_type.as_deref(), Some("application/x-deb"));
+        assert_eq!(metadata.upstream_etag.as_deref(), Some("\"abc123\""));
+        let ttl_seen = (metadata.expires_at - metadata.cached_at).num_seconds();
+        assert!(
+            (7195..=7205).contains(&ttl_seen),
+            "expected expires_at - cached_at ~= 7200s, got {}s",
+            ttl_seen
+        );
+    }
+
+    /// Pin StreamingFetchResult's content_length passthrough. The
+    /// proxy_fetch_streaming helper uses this to set Content-Length
+    /// on the outbound response; dropping it would force every
+    /// streamed proxy response to chunked transfer encoding even
+    /// when upstream advertised an exact length.
+    #[test]
+    fn test_streaming_fetch_result_carries_content_length() {
+        let dummy: BoxStream<'static, Result<Bytes>> = Box::pin(futures::stream::iter(vec![]));
+        let r = StreamingFetchResult {
+            body: dummy,
+            content_type: Some("application/octet-stream".to_string()),
+            content_length: Some(12345),
+        };
+        assert_eq!(r.content_length, Some(12345));
+        assert_eq!(r.content_type.as_deref(), Some("application/octet-stream"));
+    }
+
     /// Many small chunks should not regress to the buffering antipattern.
     /// 256 chunks of 256 bytes (64 KiB total) is comfortably below the
     /// channel depth × chunk size threshold; verifies the channel
