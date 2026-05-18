@@ -133,10 +133,7 @@ async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
         .await;
 }
 
-fn make_user_struct(
-    id: Uuid,
-    username: String,
-) -> artifact_keeper_backend::models::user::User {
+fn make_user_struct(id: Uuid, username: String) -> artifact_keeper_backend::models::user::User {
     artifact_keeper_backend::models::user::User {
         id,
         username: username.clone(),
@@ -176,10 +173,7 @@ fn build_admin_only_app(auth_service: Arc<AuthService>) -> Router {
         ))
 }
 
-async fn run_through_admin_middleware(
-    app: Router,
-    bearer: &str,
-) -> StatusCode {
+async fn run_through_admin_middleware(app: Router, bearer: &str) -> StatusCode {
     app.oneshot(
         Request::builder()
             .uri("/protected")

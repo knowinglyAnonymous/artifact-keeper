@@ -3667,7 +3667,7 @@ mod tests {
     /// Insert a fresh user row whose credential-change watermarks
     /// (`password_changed_at`, `updated_at`) are backdated by 60 seconds so
     /// tokens minted at `NOW()` are not immediately flagged invalidated by
-    /// the replica-safe `iat <= watermark` check. In production a token's
+    /// the replica-safe `iat < watermark` check. In production a token's
     /// `iat` is always strictly later than `password_changed_at` because
     /// the password is set at user creation, not at token issuance.
     async fn insert_test_user(pool: &sqlx::PgPool, username: &str) -> Uuid {
@@ -3706,13 +3706,20 @@ mod tests {
         let username = format!("repl_test_{}", &Uuid::new_v4().to_string()[..8]);
         let user_id = insert_test_user(&pool, &username).await;
 
-        // Simulate a token minted before any credential change.
-        let iat_before = (Utc::now() - Duration::seconds(60)).timestamp();
+        // Simulate a token minted strictly before the user's credential-change
+        // watermark. The helper inserts password_changed_at = NOW - 60s, and
+        // the watermark is read at seconds resolution, so we use NOW - 120s
+        // here to guarantee `iat < watermark` independent of sub-second clock
+        // drift between this process and the database server. Same-second
+        // (iat == watermark) is intentionally accepted post-#1248, so a test
+        // pinning the "issued before" semantic must leave an unambiguous gap.
+        let iat_before = (Utc::now() - Duration::seconds(120)).timestamp();
 
         // Token issued before the user's existing password_changed_at watermark
-        // (which we just inserted as NOW()) must be flagged invalidated by the
-        // DB-backed check — this exercises the cross-replica path because the
-        // in-memory fast-path map is empty for this user_id on this process.
+        // (inserted as NOW - 60s by `insert_test_user`) must be flagged
+        // invalidated by the DB-backed check. This exercises the cross-replica
+        // path because the in-memory fast-path map is empty for this user_id
+        // on this process.
         let rejected = is_token_invalidated_replica_safe(&pool, user_id, iat_before)
             .await
             .expect("DB check must succeed");
