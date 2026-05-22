@@ -30,6 +30,7 @@ use crate::services::repository_service::{
     UpdateRepositoryRequest as ServiceUpdateRepoReq,
 };
 use crate::services::routing_rules::{self, RoutingRule};
+use crate::services::upload_service;
 
 /// Require that the request is authenticated, returning an error if not.
 fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
@@ -1809,6 +1810,16 @@ pub async fn upload_artifact(
 ) -> Result<Json<ArtifactResponse>> {
     let auth = require_auth(auth)?;
     auth.require_scope("write")?;
+
+    // Validate the composed artifact path against traversal, null bytes,
+    // backslashes, percent-encoded traversal, absolute paths, etc. This
+    // protects all upload entry points (URL-path variant, multipart with
+    // path in URL, and multipart with `path` form field added in #1237).
+    // Filesystem storage's `key_to_path` would strip `..` segments, but S3
+    // and other object backends would happily accept `../etc/passwd`.
+    upload_service::validate_artifact_path(&path)
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_access(&auth, repo.id)?;
@@ -6724,5 +6735,96 @@ mod tests {
             ),
             "releases/v1.2.3-rc.1/artifact_v1.2.3+linux.x86_64.bin"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Security: composed paths must be rejected by validate_artifact_path
+    //
+    // Regression for the gap found in #1322's security review:
+    // `compose_artifact_path` happily produces `../etc/passwd` from a
+    // malicious `path` form field, and the original PR did NOT call
+    // `validate_artifact_path` on the composed value before handing it to
+    // the storage layer. Filesystem storage's `key_to_path` strips `..`
+    // segments, but S3/GCS backends do not, so a `path=../../etc/passwd`
+    // form field could escape the repository's storage key prefix.
+    //
+    // The fix is to call `validate_artifact_path` inside `upload_artifact`
+    // so every entry point (URL-path PUT, multipart-with-path POST, and
+    // the new multipart `path` form field added in #1237) is covered. The
+    // first test pins the composition+validation contract without needing
+    // a database; the second drives the actual handler end-to-end and
+    // asserts the HTTP response is 400.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_artifact_path_traversal_is_rejected_by_validator() {
+        // The composed path is exactly the attacker-controlled value
+        // (no trailing slash means the path is used verbatim).
+        let composed = compose_artifact_path(Some("../etc/passwd"), "ignored.bin");
+        assert_eq!(composed, "../etc/passwd");
+
+        // And validate_artifact_path must reject it. If this ever starts
+        // returning Ok(_) the security guarantee is gone.
+        let err = upload_service::validate_artifact_path(&composed)
+            .expect_err("../etc/passwd must be rejected as traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("traversal"),
+            "expected traversal rejection, got: {msg}"
+        );
+
+        // Belt-and-braces: a few other shapes the composer can produce
+        // from hostile form fields, all of which must fail validation.
+        for hostile in [
+            "../../etc/passwd",
+            "a/../b",
+            "file\0.txt",
+            "a/%2e%2e/b",
+            "a\\b",
+        ] {
+            assert!(
+                upload_service::validate_artifact_path(hostile).is_err(),
+                "validate_artifact_path must reject {hostile:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_artifact_rejects_traversal_path_with_400() {
+        // End-to-end pin: drive `upload_artifact` with a path produced by
+        // `compose_artifact_path("../etc/passwd", _)` and assert the
+        // handler returns 400 Bad Request without touching storage. Skips
+        // gracefully when no DATABASE_URL is configured.
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let composed = compose_artifact_path(Some("../etc/passwd"), "ignored.bin");
+        assert_eq!(composed, "../etc/passwd");
+
+        // `make_auth` builds a JWT-style AuthExtension (is_api_token =
+        // false), so `require_scope("write")` automatically passes - no
+        // need to populate `scopes`.
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+
+        let result = upload_artifact(
+            State(fx.state.clone()),
+            Extension(Some(auth)),
+            Path((fx.repo_key.clone(), composed)),
+            HeaderMap::new(),
+            Bytes::from_static(b"payload-should-never-be-stored"),
+        )
+        .await;
+
+        let err = result.expect_err("traversal path must be rejected");
+        // AppError::Validation maps to 400 Bad Request via IntoResponse
+        // (see error.rs status_and_code). Pinning the variant here is
+        // equivalent and avoids reaching into a private method.
+        assert!(
+            matches!(err, AppError::Validation(_)),
+            "traversal path must surface as Validation (400), got {err:?}",
+        );
+
+        fx.teardown().await;
     }
 }
