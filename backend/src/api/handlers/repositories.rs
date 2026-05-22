@@ -1947,7 +1947,15 @@ async fn upload_artifact_multipart_with_path(
 
 /// Upload artifact via multipart/form-data POST (no path in URL).
 ///
-/// The artifact path comes from the `file` field's filename.
+/// The artifact path is built from the optional `path` form field combined
+/// with the uploaded file's filename:
+///   - missing/empty `path` -> path is just the filename
+///   - `path` ending in `/` -> path becomes `<path><filename>` (directory prefix)
+///   - otherwise the `path` value is used verbatim as the full artifact path
+///
+/// This is what makes the web UI's "Custom path (optional)" field actually
+/// land artifacts at the requested path (#1237). Previously the form field
+/// was silently dropped and only the filename was used.
 async fn upload_artifact_multipart(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1955,15 +1963,41 @@ async fn upload_artifact_multipart(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Json<ArtifactResponse>> {
-    let (body, filename) = extract_multipart_file(multipart).await?;
+    let (body, filename, custom_path) = extract_multipart_file_and_path(multipart).await?;
+    let artifact_path = compose_artifact_path(custom_path.as_deref(), &filename);
     upload_artifact(
         State(state),
         Extension(auth),
-        Path((key, filename)),
+        Path((key, artifact_path)),
         headers,
         body,
     )
     .await
+}
+
+/// Combine an optional client-provided `path` field with the uploaded file's
+/// filename into a single artifact path.
+///
+/// Rules (see #1237):
+///   - `None` or empty `custom_path` -> `filename`
+///   - `custom_path` ending in `/`   -> `<custom_path><filename>` (directory)
+///   - otherwise                     -> `custom_path` verbatim (full path)
+///
+/// Leading slashes on `custom_path` are stripped so callers can pass either
+/// `unifi/docs/` or `/unifi/docs/`. Empty segments produced by `//` are
+/// rejected by `validate_artifact_path` later in the upload pipeline.
+fn compose_artifact_path(custom_path: Option<&str>, filename: &str) -> String {
+    let raw = custom_path.unwrap_or("").trim();
+    let trimmed = raw.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return filename.to_string();
+    }
+    if trimmed.ends_with('/') {
+        // Treat as a directory prefix: append the uploaded filename.
+        format!("{trimmed}{filename}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Extract the first file field from a multipart form.
@@ -1986,6 +2020,53 @@ async fn extract_multipart_file(mut multipart: Multipart) -> Result<(Bytes, Stri
     Err(AppError::Validation(
         "No file field found in multipart form".to_string(),
     ))
+}
+
+/// Extract both a file field and an optional `path` text field from a
+/// multipart form.
+///
+/// Iterates the full form: a file field (one with a `filename`) yields the
+/// body and original filename; a `path` field (any non-file field named
+/// `path`) yields the requested artifact path. Either may appear in any
+/// order. Returns an error if no file is found.
+async fn extract_multipart_file_and_path(
+    mut multipart: Multipart,
+) -> Result<(Bytes, String, Option<String>)> {
+    let mut file: Option<(Bytes, String)> = None;
+    let mut custom_path: Option<String> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Validation(format!("Invalid multipart data: {e}")))?
+    {
+        let filename = field.file_name().map(|s| s.to_string());
+        let name = field.name().map(|s| s.to_string());
+        if let Some(filename) = filename {
+            // File upload field
+            if file.is_none() {
+                let data: Bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Validation(format!("Failed to read file: {e}")))?;
+                file = Some((data, filename));
+            }
+        } else if name.as_deref() == Some("path") {
+            // Custom path text field
+            let value = field
+                .text()
+                .await
+                .map_err(|e| AppError::Validation(format!("Failed to read path field: {e}")))?;
+            custom_path = Some(value);
+        }
+    }
+
+    match file {
+        Some((body, filename)) => Ok((body, filename, custom_path)),
+        None => Err(AppError::Validation(
+            "No file field found in multipart form".to_string(),
+        )),
+    }
 }
 
 /// Download artifact
@@ -6533,6 +6614,115 @@ mod tests {
              upstream-fallback download (#1294). A revert to the buffered \
              `proxy_fetch` helper would re-introduce the OOM regression \
              closed by #895/#1294."
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // compose_artifact_path (#1237)
+    //
+    // The web UI's "Custom path (optional)" field is sent as a `path` form
+    // field alongside the file in a multipart POST to
+    // `/api/v1/repositories/<repo>/artifacts`. Before #1237 this field was
+    // silently dropped and only the file's filename ever reached the
+    // storage layer. These tests pin the composition rules:
+    //   - empty / missing custom_path -> use the filename only
+    //   - trailing slash -> directory prefix (append filename)
+    //   - no trailing slash -> full path verbatim
+    //   - arbitrary depth allowed (1 or N segments)
+    // The downstream `validate_artifact_path` in the upload pipeline
+    // continues to reject `..`, `//`, null bytes, etc.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_compose_artifact_path_no_custom_path_uses_filename() {
+        // Empty and absent both fall back to the filename
+        assert_eq!(compose_artifact_path(None, "foo.tar.gz"), "foo.tar.gz");
+        assert_eq!(compose_artifact_path(Some(""), "foo.tar.gz"), "foo.tar.gz");
+        assert_eq!(
+            compose_artifact_path(Some("   "), "foo.tar.gz"),
+            "foo.tar.gz",
+            "whitespace-only path should fall back to filename"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_one_segment_verbatim() {
+        // Bug repro case from #1237: custom_path `unifi/guide.pdf` should
+        // become the full artifact path, NOT `unifi-udmp-security-guide.pdf`.
+        assert_eq!(
+            compose_artifact_path(Some("unifi/guide.pdf"), "unifi-udmp-security-guide.pdf"),
+            "unifi/guide.pdf"
+        );
+        // Single-segment custom path
+        assert_eq!(
+            compose_artifact_path(Some("renamed.bin"), "original.bin"),
+            "renamed.bin"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_trailing_slash_appends_filename() {
+        // Issue #1237 explicit example: `unifi/docs/` + filename ->
+        // `unifi/docs/unifi-udmp-security-guide.pdf`
+        assert_eq!(
+            compose_artifact_path(Some("unifi/docs/"), "unifi-udmp-security-guide.pdf"),
+            "unifi/docs/unifi-udmp-security-guide.pdf"
+        );
+        // Single-segment directory
+        assert_eq!(
+            compose_artifact_path(Some("releases/"), "v1.tar.gz"),
+            "releases/v1.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_arbitrary_depth() {
+        // 3-segment path
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/file.bin"), "ignored.bin"),
+            "a/b/c/file.bin"
+        );
+        // 5-segment path (deep)
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/d/e/file.bin"), "ignored.bin"),
+            "a/b/c/d/e/file.bin"
+        );
+        // 4-segment directory prefix
+        assert_eq!(
+            compose_artifact_path(Some("a/b/c/d/"), "file.bin"),
+            "a/b/c/d/file.bin"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_strips_leading_slash() {
+        // Leading slash on the form field should not produce an absolute
+        // path (validate_artifact_path rejects those). Strip it so a UI
+        // that sends `/unifi/docs/` still works.
+        assert_eq!(
+            compose_artifact_path(Some("/unifi/docs/"), "x.pdf"),
+            "unifi/docs/x.pdf"
+        );
+        assert_eq!(
+            compose_artifact_path(Some("/unifi/guide.pdf"), "x.pdf"),
+            "unifi/guide.pdf"
+        );
+    }
+
+    #[test]
+    fn test_compose_artifact_path_with_special_chars() {
+        // Spaces, dots, dashes, underscores, plus signs - all valid in paths
+        // (the downstream validator only rejects traversal patterns).
+        assert_eq!(
+            compose_artifact_path(Some("my dir/file.tar.gz"), "x.bin"),
+            "my dir/file.tar.gz"
+        );
+        assert_eq!(
+            compose_artifact_path(
+                Some("releases/v1.2.3-rc.1/"),
+                "artifact_v1.2.3+linux.x86_64.bin"
+            ),
+            "releases/v1.2.3-rc.1/artifact_v1.2.3+linux.x86_64.bin"
         );
     }
 }
