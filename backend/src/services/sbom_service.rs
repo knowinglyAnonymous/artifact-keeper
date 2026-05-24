@@ -378,7 +378,7 @@ impl SbomService {
             .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
             .await?;
         entries.extend(scan_entries);
-        entries.sort_by(|a, b| b.first_detected_at.cmp(&a.first_detected_at));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.first_detected_at));
         Ok(entries)
     }
 
@@ -455,7 +455,7 @@ impl SbomService {
             }
         };
         entries.extend(scan_entries);
-        entries.sort_by(|a, b| b.first_detected_at.cmp(&a.first_detected_at));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.first_detected_at));
         Ok(entries)
     }
 
