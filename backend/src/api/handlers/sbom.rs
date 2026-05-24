@@ -1976,10 +1976,9 @@ mod tests {
         // The canonical form is exactly two dashes; a stray suffix must not
         // pass.
         assert!(!is_valid_cve_id("CVE-2019-10744-extra"));
-        assert!(!is_valid_cve_id("CVE-2019-10744 "));
-        // (trailing whitespace is allowed because we `trim` first; but
-        // trailing non-digit/non-whitespace bytes are not.)
+        // Trailing non-digit, non-whitespace bytes are not stripped.
         assert!(!is_valid_cve_id("CVE-2019-10744x"));
+        assert!(!is_valid_cve_id("CVE-2019-1074a"));
     }
 
     #[test]
