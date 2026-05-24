@@ -650,29 +650,112 @@ async fn convert_sbom(
 
 // === CVE History ===
 
-/// Get CVE history for an artifact
+/// Validate that a string is a well-formed CVE identifier.
+///
+/// Accepts the canonical NVD shape `CVE-YYYY-N` where `N` is any positive
+/// integer (4+ digits per CVE 2014 numbering scheme, but the count has grown
+/// past 5 digits for high-volume years like 2019). The match is
+/// case-insensitive so callers may pass `cve-2019-10744` lowercased.
+///
+/// Examples:
+///   - `CVE-2019-10744`  → true (5 digits, the v1.1.0 release-gate fixture)
+///   - `CVE-2024-12345`  → true (5 digits, modern)
+///   - `CVE-2024-123456` → true (6 digits, high-volume year)
+///   - `CVE-1999-0001`   → true (4 digits, oldest valid form)
+///   - `CVE-2019-1`      → false (sub-4-digit suffix, rejected by NVD)
+///   - `not-a-cve`       → false
+///   - empty             → false
+///
+/// Previously the endpoint rejected `CVE-2019-10744` outright because the
+/// path param was typed as `Uuid`, producing a generic 400 with no useful
+/// error message. (#1375)
+pub(crate) fn is_valid_cve_id(s: &str) -> bool {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    let prefix = match parts.next() {
+        Some(p) => p,
+        None => return false,
+    };
+    if !prefix.eq_ignore_ascii_case("CVE") {
+        return false;
+    }
+    let year = match parts.next() {
+        Some(y) => y,
+        None => return false,
+    };
+    let number = match parts.next() {
+        Some(n) => n,
+        None => return false,
+    };
+    if parts.next().is_some() {
+        // Extra dashes (e.g. `CVE-2024-12345-extra`) are not part of the
+        // canonical form. Reject so a stray suffix doesn't silently slip
+        // through.
+        return false;
+    }
+    // Year is exactly four ASCII digits (NVD numbering: CVE-1999-* through
+    // CVE-9999-*). We tolerate the future-year tail.
+    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // Number must be at least four ASCII digits. CVE numbering uses 4+ digits
+    // and allows arbitrary growth (six-digit numbers exist in 2024+).
+    if number.len() < 4 || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    true
+}
+
+/// Get CVE history by artifact UUID or CVE identifier.
+///
+/// The path param accepts either:
+///   - A UUID `artifact_id` (legacy shape, returns all CVEs for one artifact)
+///   - A CVE id like `CVE-2019-10744` (returns this CVE across every artifact
+///     the caller can access)
+///
+/// Issue #1375: prior to this fix the route was typed `Path<Uuid>`, so any
+/// CVE-id call (e.g. the release-gate `GET /sbom/cve/history/CVE-2019-10744`)
+/// failed Axum's path extractor with a bare HTTP 400, leaving consumers
+/// unable to look up history by CVE.
 #[utoipa::path(
     get,
-    path = "/cve/history/{artifact_id}",
+    path = "/cve/history/{id}",
     context_path = "/api/v1/sbom",
     tag = "sbom",
     params(
-        ("artifact_id" = Uuid, Path, description = "Artifact ID")
+        ("id" = String, Path, description = "Artifact UUID or CVE identifier (e.g. CVE-2019-10744)")
     ),
     responses(
         (status = 200, description = "CVE history entries", body = Vec<crate::models::sbom::CveHistoryEntry>),
+        (status = 400, description = "Path id is neither a valid UUID nor a valid CVE identifier"),
     ),
     security(("bearer_auth" = []))
 )]
 async fn get_cve_history(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Path(artifact_id): Path<Uuid>,
+    Path(id): Path<String>,
 ) -> Result<Json<Vec<crate::models::sbom::CveHistoryEntry>>> {
-    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
     let service = SbomService::new(state.db.clone());
-    let entries = service.get_cve_history(artifact_id).await?;
-    Ok(Json(entries))
+
+    // Try UUID first: this preserves the legacy artifact_id call path.
+    if let Ok(artifact_id) = Uuid::parse_str(&id) {
+        ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+        let entries = service.get_cve_history(artifact_id).await?;
+        return Ok(Json(entries));
+    }
+
+    // Fall back to CVE-id lookup across artifacts the caller can see.
+    if is_valid_cve_id(&id) {
+        let entries = service
+            .get_cve_history_by_cve_id(&id, auth.allowed_repo_ids.as_deref())
+            .await?;
+        return Ok(Json(entries));
+    }
+
+    Err(AppError::Validation(format!(
+        "Path id '{id}' is neither a valid UUID nor a CVE identifier (expected `CVE-YYYY-N`)"
+    )))
 }
 
 /// Update CVE status
@@ -1820,5 +1903,101 @@ mod tests {
         let r = sbom_read_details(Uuid::new_v4(), "cyclonedx", "by_id");
         assert!(g.is_object(), "generated payload must be a JSON object");
         assert!(r.is_object(), "read payload must be a JSON object");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_cve_id: regression coverage for #1375. The bug surfaced as a
+    // bare HTTP 400 from `GET /sbom/cve/history/CVE-2019-10744` because the
+    // path extractor was typed `Path<Uuid>`. The fix moves the validator into
+    // application code so these cases are exercised in unit tests rather
+    // than only at the route boundary.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_valid_cve_id_release_gate_fixture() {
+        // CVE-2019-10744 is the lodash 4.17.4 prototype-pollution fixture
+        // pinned by the release-gate scan-completion tests. The 400 bug
+        // (#1375) reproduced specifically on this id.
+        assert!(is_valid_cve_id("CVE-2019-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_five_digit_suffix() {
+        assert!(is_valid_cve_id("CVE-2024-12345"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_six_digit_suffix() {
+        // Modern CVE numbering exceeds 5 digits in high-volume years; the
+        // validator must accept arbitrary digit counts >= 4 to keep working
+        // as the catalogue grows.
+        assert!(is_valid_cve_id("CVE-2024-123456"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_four_digit_suffix() {
+        // CVE-1999-0001 is the canonical oldest valid id; 4 digits is the
+        // documented minimum.
+        assert!(is_valid_cve_id("CVE-1999-0001"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_lowercase_accepted() {
+        // Callers sometimes lowercase the prefix; the response shape is
+        // identical to upper-case so we accept it rather than 400ing.
+        assert!(is_valid_cve_id("cve-2019-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_short_suffix() {
+        // < 4 digit suffix is malformed under NVD numbering.
+        assert!(!is_valid_cve_id("CVE-2019-1"));
+        assert!(!is_valid_cve_id("CVE-2019-12"));
+        assert!(!is_valid_cve_id("CVE-2019-123"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_non_cve_string() {
+        assert!(!is_valid_cve_id("not-a-cve"));
+        assert!(!is_valid_cve_id(""));
+        assert!(!is_valid_cve_id("uuid-style-string"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_wrong_year_shape() {
+        // The year segment is exactly four ASCII digits.
+        assert!(!is_valid_cve_id("CVE-19-10744"));
+        assert!(!is_valid_cve_id("CVE-20191-10744"));
+        assert!(!is_valid_cve_id("CVE-YYYY-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_rejects_trailing_garbage() {
+        // The canonical form is exactly two dashes; a stray suffix must not
+        // pass.
+        assert!(!is_valid_cve_id("CVE-2019-10744-extra"));
+        assert!(!is_valid_cve_id("CVE-2019-10744 "));
+        // (trailing whitespace is allowed because we `trim` first; but
+        // trailing non-digit/non-whitespace bytes are not.)
+        assert!(!is_valid_cve_id("CVE-2019-10744x"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_strips_outer_whitespace() {
+        // `trim` only — interior whitespace still invalidates.
+        assert!(is_valid_cve_id("  CVE-2019-10744  "));
+        assert!(!is_valid_cve_id("CVE -2019-10744"));
+    }
+
+    #[test]
+    fn test_is_valid_cve_id_path_dispatch_distinguishes_uuid_vs_cve() {
+        // The handler's dispatch decides UUID-first, CVE-id-second, else
+        // 400. Make sure a UUID parses as a UUID (so artifact lookup wins)
+        // and a CVE id parses as a CVE id (so cross-artifact lookup wins).
+        let uuid = Uuid::new_v4();
+        assert!(Uuid::parse_str(&uuid.to_string()).is_ok());
+        assert!(!is_valid_cve_id(&uuid.to_string()));
+        assert!(Uuid::parse_str("CVE-2019-10744").is_err());
+        assert!(is_valid_cve_id("CVE-2019-10744"));
     }
 }
