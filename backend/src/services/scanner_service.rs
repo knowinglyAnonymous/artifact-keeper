@@ -341,12 +341,16 @@ pub(crate) fn should_skip_reuse_for_same_artifact(
 /// the rest of the codebase (we'd rather over-dedup than re-scan the
 /// same bytes twice).
 ///
-/// This function is intentionally not called by production code: the
-/// actual TTL window lives in the SQL query so the database can use the
-/// index. The Rust mirror exists to pin the semantics in a way that is
-/// unit-testable (no DB round-trip) and to give future refactors that
-/// move the predicate into Rust a tested starting point.
-#[allow(dead_code)]
+/// Called from [`ScannerService::prepare_artifact_scan`] as a
+/// defense-in-depth check on rows returned by
+/// `find_existing_scan_for_artifact`: the SQL already filters on
+/// `completed_at > NOW() - $ttl`, so under normal operation this Rust
+/// re-check is a no-op. The value of the redundant check is that if a
+/// future SQL refactor accidentally relaxes the predicate (drops the
+/// interval clause, swaps the comparison, etc.), this guard demotes the
+/// stale row to `InsertPlaceholder` instead of silently short-circuiting
+/// to ancient bytes. Keeping the predicate live in Rust also means the
+/// unit tests below pin semantics the next refactor must preserve.
 pub(crate) fn is_within_dedup_ttl(
     completed_at: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -2465,6 +2469,29 @@ impl ScannerService {
                 .await
                 .ok()
                 .flatten();
+
+            // Defense-in-depth: the SQL in find_existing_scan_for_artifact
+            // already enforces the TTL via `completed_at > NOW() - ttl`, but
+            // we re-check the returned row's completed_at in Rust as a guard
+            // against a future SQL refactor that accidentally relaxes the
+            // predicate. If the row is somehow outside the window, drop the
+            // short-circuit and fall through to inserting a fresh placeholder
+            // so an ancient scan never gets reused silently. See
+            // is_within_dedup_ttl for the rationale.
+            let existing = existing.filter(|scan| {
+                let within =
+                    is_within_dedup_ttl(scan.completed_at, chrono::Utc::now(), DEDUP_TTL_DAYS);
+                if !within {
+                    warn!(
+                        "find_existing_scan_for_artifact returned scan {} \
+                         outside the {} day dedup TTL (completed_at={:?}); \
+                         dropping short-circuit and scanning fresh. This is \
+                         a SQL/Rust drift bug.",
+                        scan.id, DEDUP_TTL_DAYS, scan.completed_at,
+                    );
+                }
+                within
+            });
 
             match decide_short_circuit_from_existing(existing.as_ref()) {
                 ShortCircuitDecision::UseExisting(id) => {

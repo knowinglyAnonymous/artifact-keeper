@@ -447,3 +447,172 @@ async fn test_find_existing_returns_most_recent_when_multiple_completed_exist() 
 
     cleanup(&pool, repo_id).await;
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent race: orphan placeholder + completed sibling + two trigger_scan
+// calls in flight at once.
+//
+// Real-world setup that produced #1373:
+//   1. A trigger_scan call inserted a `running` placeholder but the worker
+//      never finished (process killed, scanner crashed, etc.). The placeholder
+//      is now an orphan in `running` state, waiting for the stuck-scan janitor.
+//   2. A later trigger_scan call for the same artifact + bytes successfully
+//      ran and inserted a `completed` row.
+//   3. Two more trigger_scan calls land concurrently on the same artifact.
+//
+// Without the #1373 short-circuit, step 3 inserts two more `running`
+// placeholders and runs two redundant scans, leaving four+ completed rows
+// for one artifact. With the fix, both concurrent calls must:
+//   a. Return the same scan_id (the completed sibling's id, not a new UUID).
+//   b. Leave the orphan placeholder convertible by the same dedup machinery
+//      (convert_to_reused) that scan_artifact_inner runs against any
+//      placeholder that races with a sibling completion.
+//
+// This test commits the orphan + sibling via SQL, races two
+// `find_existing_scan_for_artifact` calls (the same DB call
+// `prepare_artifact_scan` performs to populate the trigger response), then
+// drives `convert_to_reused` on the orphan to assert the terminal state.
+//
+// Note: a full end-to-end race through `ScannerService::prepare_artifact_scan`
+// would require wiring an `AdvisoryClient`, storage backend, and per-scanner
+// stubs into a real `ScannerService`. We deliberately go through the same
+// `ScanResultService` calls `prepare_artifact_scan` makes per scanner, which
+// is where the dedup contract lives. The orchestration above those calls is
+// covered by the pure-function unit tests in `scanner_service::tests`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore] // Requires database; cleanup is intentionally skipped so a `cargo test --ignored` run can verify state against the live DB.
+async fn test_concurrent_trigger_scan_race_returns_same_scan_id_and_converts_orphan() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool).await;
+    let artifact_id = insert_artifact(&pool, repo_id, "race.tgz", CHECKSUM_A).await;
+
+    // Pre-existing completed scan (the "winner" both concurrent triggers must
+    // short-circuit to). Use a recent completed_at so the TTL window contains
+    // it. Inserted before the orphan so ORDER BY completed_at DESC still picks
+    // it: completed_at = NOW().
+    let winner_id = insert_scan(
+        &pool,
+        artifact_id,
+        repo_id,
+        CHECKSUM_A,
+        "dependency",
+        "completed",
+        0,
+    )
+    .await;
+
+    // Pre-existing orphan placeholder from a previous trigger that never
+    // finished. status = 'running', completed_at = NULL. This is the row that
+    // must end up converted (NOT left stuck for the janitor).
+    let orphan_id = insert_scan(
+        &pool,
+        artifact_id,
+        repo_id,
+        CHECKSUM_A,
+        "dependency",
+        "running",
+        0,
+    )
+    .await;
+
+    let svc = std::sync::Arc::new(ScanResultService::new(pool.clone()));
+
+    // Race two find_existing_scan_for_artifact calls. This is the DB call
+    // `prepare_artifact_scan` issues per scanner before deciding whether to
+    // short-circuit or insert a placeholder. Both must return Some(winner_id);
+    // racing them concurrently exercises the same path two real trigger_scan
+    // requests would take.
+    let svc_a = svc.clone();
+    let svc_b = svc.clone();
+    let (res_a, res_b) = tokio::join!(
+        async move {
+            svc_a
+                .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30)
+                .await
+        },
+        async move {
+            svc_b
+                .find_existing_scan_for_artifact(artifact_id, CHECKSUM_A, "dependency", 30)
+                .await
+        },
+    );
+
+    let row_a = res_a
+        .expect("trigger A: query must not error")
+        .expect("trigger A: must find the completed sibling");
+    let row_b = res_b
+        .expect("trigger B: query must not error")
+        .expect("trigger B: must find the completed sibling");
+
+    // Assertion 1: both concurrent triggers return the same scan_id (the
+    // existing completed scan, NOT a freshly minted placeholder UUID). This is
+    // the contract release-gate run 26344757642 originally broke.
+    assert_eq!(
+        row_a.id, winner_id,
+        "concurrent trigger A must short-circuit to the existing completed scan"
+    );
+    assert_eq!(
+        row_b.id, winner_id,
+        "concurrent trigger B must short-circuit to the existing completed scan"
+    );
+    assert_eq!(
+        row_a.id, row_b.id,
+        "two concurrent trigger_scan calls on identical bytes must return the same scan_id"
+    );
+
+    // Drive the orphan-conversion path that scan_artifact_inner runs when
+    // find_reusable_scan matches a sibling completed scan for the same
+    // artifact. This is the production code path for cleaning up the orphan
+    // placeholder a previous trigger left behind.
+    let converted = svc
+        .convert_to_reused(orphan_id, winner_id, artifact_id)
+        .await
+        .expect("orphan conversion must succeed");
+
+    // Assertion 2: orphan is now in a terminal state and points at the winner.
+    assert_eq!(
+        converted.id, orphan_id,
+        "convert_to_reused must operate on the orphan row (not insert a new one)"
+    );
+    assert_eq!(
+        converted.status, "completed",
+        "orphan must be flipped from 'running' to 'completed' so the stuck-scan janitor never has to reap it"
+    );
+    assert!(
+        converted.is_reused,
+        "converted orphan must be marked is_reused = true"
+    );
+    assert_eq!(
+        converted.source_scan_id,
+        Some(winner_id),
+        "converted orphan must point source_scan_id at the winner"
+    );
+
+    // Re-read from the DB to confirm the UPDATE landed in shared storage, not
+    // just in the returned struct. This catches a regression where
+    // convert_to_reused might return a fabricated row without committing.
+    // Using untyped `sqlx::query` (not `query!`) so the test compiles without
+    // a SQLX_OFFLINE cache entry; the assertions below are the contract.
+    let reloaded: (String, bool, Option<Uuid>) =
+        sqlx::query_as("SELECT status, is_reused, source_scan_id FROM scan_results WHERE id = $1")
+            .bind(orphan_id)
+            .fetch_one(&pool)
+            .await
+            .expect("orphan row must still exist after conversion");
+    assert_eq!(reloaded.0, "completed");
+    assert!(reloaded.1);
+    assert_eq!(reloaded.2, Some(winner_id));
+
+    // Cleanup is intentionally skipped so a `cargo test --ignored` run leaves
+    // the converted row, the winner, the artifact, and the repo in place for
+    // manual inspection against a real DB (e.g., to verify the orphan row's
+    // completed_at was set by NOW() rather than copied from the source). Tests
+    // that need a clean slate can drop the repo by key prefix
+    // `test-dedup-short-circuit-`.
+    let _ = repo_id; // suppress unused-binding warning under the skip-cleanup path
+}
