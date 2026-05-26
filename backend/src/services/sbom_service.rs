@@ -373,7 +373,12 @@ impl SbomService {
         // (see #1375: `record_cve` is presently dead code, so the scan-derived
         // path is the only source of real CVE data). De-dupe by `cve_id` so a
         // CVE that exists in both tables surfaces once with the curated row.
-        let known: HashSet<String> = entries.iter().map(|e| e.cve_id.clone()).collect();
+        // Normalize to upper-case so the dedupe is case-insensitive (schema
+        // does not constrain `cve_id` case in either table).
+        let known: HashSet<String> = entries
+            .iter()
+            .map(|e| e.cve_id.to_ascii_uppercase())
+            .collect();
         let scan_entries = self
             .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
             .await?;
@@ -402,17 +407,22 @@ impl SbomService {
         allowed_repo_ids: Option<&[Uuid]>,
     ) -> Result<Vec<CveHistoryEntry>> {
         // Normalize: NVD shape is upper-case; lower-case is a common typo.
+        // Schema does not constrain `cve_id` case in either `cve_history` or
+        // `scan_findings`, so we compare case-insensitively and only use the
+        // upper-cased form for display/known-set dedupe below.
         let cve_id_upper = cve_id.to_ascii_uppercase();
 
         // 1. Curated rows from cve_history. We join through artifacts so we
         //    can filter by allowed_repo_ids without a second round-trip.
+        //    LOWER(...)=LOWER(...) so a scanner that wrote lower-case still
+        //    matches an upper-case query (and vice versa).
         let mut entries: Vec<CveHistoryEntry> = if let Some(repo_ids) = allowed_repo_ids {
             sqlx::query_as::<_, CveHistoryEntry>(
                 r#"
                 SELECT ch.*
                 FROM cve_history ch
                 JOIN artifacts a ON ch.artifact_id = a.id
-                WHERE ch.cve_id = $1
+                WHERE LOWER(ch.cve_id) = LOWER($1)
                   AND a.repository_id = ANY($2)
                   AND NOT a.is_deleted
                 ORDER BY ch.first_detected_at DESC
@@ -428,7 +438,7 @@ impl SbomService {
                 SELECT ch.*
                 FROM cve_history ch
                 JOIN artifacts a ON ch.artifact_id = a.id
-                WHERE ch.cve_id = $1
+                WHERE LOWER(ch.cve_id) = LOWER($1)
                   AND NOT a.is_deleted
                 ORDER BY ch.first_detected_at DESC
                 "#,
@@ -439,8 +449,12 @@ impl SbomService {
         };
 
         // 2. Live findings from scan_findings, skipping cve_ids we already
-        //    surfaced via the curated path.
-        let known: HashSet<String> = entries.iter().map(|e| e.cve_id.clone()).collect();
+        //    surfaced via the curated path. `known` is normalized so the
+        //    dedupe is case-insensitive too.
+        let known: HashSet<String> = entries
+            .iter()
+            .map(|e| e.cve_id.to_ascii_uppercase())
+            .collect();
         let scan_entries = self
             .build_cve_entries_from_scan_findings(None, Some(&cve_id_upper), &known)
             .await?;
@@ -554,7 +568,7 @@ impl SbomService {
                     MAX(created_at) AS last_detected_at,
                     BOOL_AND(is_acknowledged) AS all_acknowledged
                 FROM scan_findings
-                WHERE cve_id = $1
+                WHERE LOWER(cve_id) = LOWER($1)
                 GROUP BY artifact_id, cve_id
                 ORDER BY MIN(created_at) DESC
                 "#,
@@ -571,9 +585,11 @@ impl SbomService {
         Ok(rows
             .into_iter()
             .filter(|r| {
+                // Dedupe case-insensitively: the curated path normalizes its
+                // `known` set to upper-case before passing it in.
                 r.cve_id
                     .as_deref()
-                    .map(|c| !known.contains(c))
+                    .map(|c| !known.contains(&c.to_ascii_uppercase()))
                     .unwrap_or(false)
             })
             .map(|r| CveHistoryEntry {
@@ -651,8 +667,15 @@ impl SbomService {
     /// direct equivalent in `scan_findings`. We approximate:
     ///   - open: findings where `NOT is_acknowledged`
     ///   - acknowledged: findings where `is_acknowledged`
-    ///   - fixed: 0 (scan_findings has no "fixed" state; if a finding goes
-    ///     away on the next scan it's simply absent)
+    ///   - fixed: union of two sources, deduped by (artifact_id, cve_id):
+    ///     (a) curated `cve_history` rows with `status='fixed'` (preserves
+    ///     the legacy admin/promotion-policy semantic for the rare callers
+    ///     that write to that table); plus
+    ///     (b) CVEs that appeared in an earlier `scan_findings` row for an
+    ///     artifact but are absent from that artifact's most recent
+    ///     `scan_results` (per `scan_type`). "Disappeared on rescan" is the
+    ///     closest signal we have to a fixed CVE without a real fixed-at
+    ///     timestamp.
     ///
     /// We dedupe by (artifact_id, cve_id) so multi-scanner overlap doesn't
     /// double-count a single vulnerability.
@@ -801,10 +824,119 @@ impl SbomService {
             })
             .collect();
 
+        // fixed_cves: union of two definitions, deduped by (artifact_id, cve_id):
+        //   (a) curated `cve_history` rows with status='fixed'
+        //   (b) CVEs present in an earlier scan_findings row for an artifact
+        //       but absent from that artifact's most recent scan_result per
+        //       scan_type (i.e. they "fell off" on rescan)
+        // This avoids the silent-zero regression while still being correct
+        // when no curated rows exist.
+        let fixed_cves: i64 = if let Some(repo_id) = repository_id {
+            sqlx::query_scalar(
+                r#"
+                WITH curated_fixed AS (
+                    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
+                    FROM cve_history ch
+                    JOIN artifacts a ON ch.artifact_id = a.id
+                    WHERE ch.status = 'fixed'
+                      AND ch.cve_id IS NOT NULL
+                      AND a.repository_id = $1
+                      AND NOT a.is_deleted
+                ),
+                latest_scans AS (
+                    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+                        sr.id, sr.artifact_id, sr.scan_type
+                    FROM scan_results sr
+                    JOIN artifacts a ON sr.artifact_id = a.id
+                    WHERE sr.status = 'completed'
+                      AND a.repository_id = $1
+                      AND NOT a.is_deleted
+                    ORDER BY sr.artifact_id, sr.scan_type, sr.created_at DESC
+                ),
+                ever_seen AS (
+                    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+                    FROM scan_findings sf
+                    JOIN artifacts a ON sf.artifact_id = a.id
+                    WHERE sf.cve_id IS NOT NULL
+                      AND a.repository_id = $1
+                      AND NOT a.is_deleted
+                ),
+                still_present AS (
+                    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+                    FROM scan_findings sf
+                    JOIN latest_scans ls ON sf.scan_result_id = ls.id
+                    WHERE sf.cve_id IS NOT NULL
+                ),
+                disappeared AS (
+                    SELECT e.artifact_id, e.cve_id FROM ever_seen e
+                    EXCEPT
+                    SELECT s.artifact_id, s.cve_id FROM still_present s
+                ),
+                unioned AS (
+                    SELECT artifact_id, cve_id FROM curated_fixed
+                    UNION
+                    SELECT artifact_id, cve_id FROM disappeared
+                )
+                SELECT COUNT(*) FROM unioned
+                "#,
+            )
+            .bind(repo_id)
+            .fetch_one(&self.db)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                r#"
+                WITH curated_fixed AS (
+                    SELECT DISTINCT ch.artifact_id, LOWER(ch.cve_id) AS cve_id
+                    FROM cve_history ch
+                    JOIN artifacts a ON ch.artifact_id = a.id
+                    WHERE ch.status = 'fixed'
+                      AND ch.cve_id IS NOT NULL
+                      AND NOT a.is_deleted
+                ),
+                latest_scans AS (
+                    SELECT DISTINCT ON (sr.artifact_id, sr.scan_type)
+                        sr.id, sr.artifact_id, sr.scan_type
+                    FROM scan_results sr
+                    JOIN artifacts a ON sr.artifact_id = a.id
+                    WHERE sr.status = 'completed'
+                      AND NOT a.is_deleted
+                    ORDER BY sr.artifact_id, sr.scan_type, sr.created_at DESC
+                ),
+                ever_seen AS (
+                    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+                    FROM scan_findings sf
+                    JOIN artifacts a ON sf.artifact_id = a.id
+                    WHERE sf.cve_id IS NOT NULL
+                      AND NOT a.is_deleted
+                ),
+                still_present AS (
+                    SELECT DISTINCT sf.artifact_id, LOWER(sf.cve_id) AS cve_id
+                    FROM scan_findings sf
+                    JOIN latest_scans ls ON sf.scan_result_id = ls.id
+                    WHERE sf.cve_id IS NOT NULL
+                ),
+                disappeared AS (
+                    SELECT e.artifact_id, e.cve_id FROM ever_seen e
+                    EXCEPT
+                    SELECT s.artifact_id, s.cve_id FROM still_present s
+                ),
+                unioned AS (
+                    SELECT artifact_id, cve_id FROM curated_fixed
+                    UNION
+                    SELECT artifact_id, cve_id FROM disappeared
+                )
+                SELECT COUNT(*) FROM unioned
+                "#,
+            )
+            .fetch_one(&self.db)
+            .await?
+        };
+
         Ok(CveTrends {
             total_cves: total,
             open_cves: open,
-            fixed_cves: 0,
+            fixed_cves,
             acknowledged_cves: acknowledged,
             critical_count: critical,
             high_count: high,
