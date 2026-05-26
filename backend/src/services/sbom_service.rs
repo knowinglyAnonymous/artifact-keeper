@@ -34,7 +34,7 @@ struct ScanFindingCveRow {
 /// re-reads. Hashing instead of `Uuid::new_v4` means clients can dedupe by
 /// id even when the row is synthesized at read time. The first 16 bytes of
 /// SHA-256(artifact_id || cve_id) become the UUID. Synth ids carry no
-/// foreign-key meaning — `update_cve_status` against them will 404, which
+/// foreign-key meaning, `update_cve_status` against them will 404, which
 /// is correct.
 pub(crate) fn synth_cve_id(artifact_id: Uuid, cve_id: &str) -> Uuid {
     let mut hasher = Sha256::new();
@@ -45,6 +45,145 @@ pub(crate) fn synth_cve_id(artifact_id: Uuid, cve_id: &str) -> Uuid {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
+}
+
+/// Collect a case-insensitive (upper-cased) set of CVE identifiers from a
+/// slice of curated `CveHistoryEntry` rows.
+///
+/// Pulled out of the read paths so the dedupe-by-cve normalization is
+/// covered by unit tests without needing a database. The CVE-history
+/// pipeline calls this once per query to build the `known` set passed to
+/// `build_cve_entries_from_scan_findings`.
+pub(crate) fn build_known_cve_set(entries: &[CveHistoryEntry]) -> HashSet<String> {
+    entries
+        .iter()
+        .map(|e| e.cve_id.to_ascii_uppercase())
+        .collect()
+}
+
+/// Decide whether a `scan_findings`-derived row should pass the dedupe
+/// filter. A row passes only when it has a `cve_id` and that id (compared
+/// case-insensitively) is not already in the curated `known` set.
+///
+/// Extracted so the case-insensitivity contract is unit-testable. See
+/// #1375 -- without this normalization the scan-derived path would
+/// duplicate any CVE whose case differs between `cve_history` and
+/// `scan_findings`.
+pub(crate) fn scan_row_passes_known_filter(
+    row_cve_id: Option<&str>,
+    known: &HashSet<String>,
+) -> bool {
+    row_cve_id
+        .map(|c| !known.contains(&c.to_ascii_uppercase()))
+        .unwrap_or(false)
+}
+
+/// Map the `all_acknowledged` flag aggregated from `scan_findings` to the
+/// `CveHistoryEntry.status` string (`"acknowledged"` vs `"open"`). The
+/// scanner has no notion of `fixed` or `false_positive`, those statuses
+/// only exist on curated rows.
+pub(crate) fn status_string_from_acknowledged(all_acknowledged: bool) -> &'static str {
+    if all_acknowledged {
+        "acknowledged"
+    } else {
+        "open"
+    }
+}
+
+/// Map the `all_acknowledged` flag to a typed `CveStatus` for the timeline
+/// projection in `get_cve_trends`. Mirrors `status_string_from_acknowledged`
+/// but returns the enum directly because the timeline DTO is typed.
+pub(crate) fn status_enum_from_acknowledged(all_acknowledged: bool) -> CveStatus {
+    if all_acknowledged {
+        CveStatus::Acknowledged
+    } else {
+        CveStatus::Open
+    }
+}
+
+/// Convert a `ScanFindingCveRow` aggregate into a synthetic
+/// `CveHistoryEntry`. Pure mapping, no DB access -- factored out so the
+/// field-by-field projection is covered by unit tests.
+///
+/// Synth entries carry:
+///   - `id` = `synth_cve_id(artifact_id, cve_id)` (deterministic)
+///   - `sbom_id` / `component_id` / `scan_result_id` = `None` (no FK)
+///   - `cve_id` = empty string when the row's `cve_id` is `None`
+///     (callers filter these out via `scan_row_passes_known_filter` before
+///     mapping, but the defensive default keeps the mapping total).
+///   - `status` from `all_acknowledged`
+///   - `created_at` / `updated_at` aligned to first/last detection
+fn scan_finding_to_history_entry(row: ScanFindingCveRow) -> CveHistoryEntry {
+    let cve_id = row.cve_id.unwrap_or_default();
+    let id = synth_cve_id(row.artifact_id, &cve_id);
+    CveHistoryEntry {
+        id,
+        artifact_id: row.artifact_id,
+        sbom_id: None,
+        component_id: None,
+        scan_result_id: None,
+        cve_id,
+        affected_component: row.affected_component,
+        affected_version: row.affected_version,
+        fixed_version: row.fixed_version,
+        severity: row.severity,
+        cvss_score: None,
+        cve_published_at: None,
+        first_detected_at: row.first_detected_at,
+        last_detected_at: row.last_detected_at,
+        status: status_string_from_acknowledged(row.all_acknowledged).to_string(),
+        acknowledged_by: None,
+        acknowledged_at: None,
+        acknowledged_reason: None,
+        created_at: row.first_detected_at,
+        updated_at: row.last_detected_at,
+    }
+}
+
+/// Convert a `ScanFindingCveRow` aggregate into a `CveTimelineEntry` for
+/// the trends timeline. `now` is injected so tests can pin `days_exposed`
+/// without `Utc::now()` racing the assertion.
+fn scan_finding_to_timeline_entry(row: &ScanFindingCveRow, now: DateTime<Utc>) -> CveTimelineEntry {
+    let days_exposed = (now - row.first_detected_at).num_days();
+    CveTimelineEntry {
+        cve_id: row.cve_id.clone().unwrap_or_default(),
+        severity: row.severity.clone().unwrap_or_default(),
+        affected_component: row.affected_component.clone().unwrap_or_default(),
+        cve_published_at: None,
+        first_detected_at: row.first_detected_at,
+        status: status_enum_from_acknowledged(row.all_acknowledged),
+        days_exposed,
+    }
+}
+
+/// Drop entries whose owning artifact's repo is not in `allowed_repos`.
+///
+/// Pulled out of `filter_entries_by_repo` so the filter logic itself
+/// (independent of the DB lookup that builds `repo_by_artifact`) is
+/// unit-testable. The DB call still lives in the async method; this
+/// helper handles the in-memory partition once that map is available.
+pub(crate) fn filter_entries_by_repo_map(
+    entries: Vec<CveHistoryEntry>,
+    repo_by_artifact: &std::collections::HashMap<Uuid, Uuid>,
+    allowed_repos: &HashSet<Uuid>,
+) -> Vec<CveHistoryEntry> {
+    entries
+        .into_iter()
+        .filter(|e| {
+            repo_by_artifact
+                .get(&e.artifact_id)
+                .map(|r| allowed_repos.contains(r))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Sort `CveHistoryEntry` rows by `first_detected_at` descending (newest
+/// first). The read paths concatenate curated + scan-derived rows then
+/// re-sort so the response is monotonic; extracted so the sort key is
+/// guaranteed by a unit test and won't drift if the type changes.
+pub(crate) fn sort_entries_by_first_detected_desc(entries: &mut [CveHistoryEntry]) {
+    entries.sort_by_key(|e| std::cmp::Reverse(e.first_detected_at));
 }
 
 /// SBOM service for generating and managing SBOMs.
@@ -375,15 +514,12 @@ impl SbomService {
         // CVE that exists in both tables surfaces once with the curated row.
         // Normalize to upper-case so the dedupe is case-insensitive (schema
         // does not constrain `cve_id` case in either table).
-        let known: HashSet<String> = entries
-            .iter()
-            .map(|e| e.cve_id.to_ascii_uppercase())
-            .collect();
+        let known = build_known_cve_set(&entries);
         let scan_entries = self
             .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
             .await?;
         entries.extend(scan_entries);
-        entries.sort_by_key(|e| std::cmp::Reverse(e.first_detected_at));
+        sort_entries_by_first_detected_desc(&mut entries);
         Ok(entries)
     }
 
@@ -451,10 +587,7 @@ impl SbomService {
         // 2. Live findings from scan_findings, skipping cve_ids we already
         //    surfaced via the curated path. `known` is normalized so the
         //    dedupe is case-insensitive too.
-        let known: HashSet<String> = entries
-            .iter()
-            .map(|e| e.cve_id.to_ascii_uppercase())
-            .collect();
+        let known = build_known_cve_set(&entries);
         let scan_entries = self
             .build_cve_entries_from_scan_findings(None, Some(&cve_id_upper), &known)
             .await?;
@@ -469,7 +602,7 @@ impl SbomService {
             }
         };
         entries.extend(scan_entries);
-        entries.sort_by_key(|e| std::cmp::Reverse(e.first_detected_at));
+        sort_entries_by_first_detected_desc(&mut entries);
         Ok(entries)
     }
 
@@ -498,15 +631,11 @@ impl SbomService {
         .fetch_all(&self.db)
         .await?;
         let repo_by_artifact: std::collections::HashMap<Uuid, Uuid> = rows.into_iter().collect();
-        Ok(entries
-            .into_iter()
-            .filter(|e| {
-                repo_by_artifact
-                    .get(&e.artifact_id)
-                    .map(|r| allowed_repos.contains(r))
-                    .unwrap_or(false)
-            })
-            .collect())
+        Ok(filter_entries_by_repo_map(
+            entries,
+            &repo_by_artifact,
+            allowed_repos,
+        ))
     }
 
     /// Build synthetic `CveHistoryEntry` rows from `scan_findings`.
@@ -584,43 +713,8 @@ impl SbomService {
 
         Ok(rows
             .into_iter()
-            .filter(|r| {
-                // Dedupe case-insensitively: the curated path normalizes its
-                // `known` set to upper-case before passing it in.
-                r.cve_id
-                    .as_deref()
-                    .map(|c| !known.contains(&c.to_ascii_uppercase()))
-                    .unwrap_or(false)
-            })
-            .map(|r| CveHistoryEntry {
-                // No real `id` for a synthetic row. Use a deterministic UUID
-                // derived from (artifact_id, cve_id) so re-reads stay stable
-                // and don't collide with curated rows.
-                id: synth_cve_id(r.artifact_id, r.cve_id.as_deref().unwrap_or("")),
-                artifact_id: r.artifact_id,
-                sbom_id: None,
-                component_id: None,
-                scan_result_id: None,
-                cve_id: r.cve_id.unwrap_or_default(),
-                affected_component: r.affected_component,
-                affected_version: r.affected_version,
-                fixed_version: r.fixed_version,
-                severity: r.severity,
-                cvss_score: None,
-                cve_published_at: None,
-                first_detected_at: r.first_detected_at,
-                last_detected_at: r.last_detected_at,
-                status: if r.all_acknowledged {
-                    "acknowledged".to_string()
-                } else {
-                    "open".to_string()
-                },
-                acknowledged_by: None,
-                acknowledged_at: None,
-                acknowledged_reason: None,
-                created_at: r.first_detected_at,
-                updated_at: r.last_detected_at,
-            })
+            .filter(|r| scan_row_passes_known_filter(r.cve_id.as_deref(), known))
+            .map(scan_finding_to_history_entry)
             .collect())
     }
 
@@ -804,24 +898,10 @@ impl SbomService {
             .await?
         };
 
+        let now = Utc::now();
         let timeline: Vec<CveTimelineEntry> = timeline_rows
-            .into_iter()
-            .map(|r| {
-                let days_exposed = (Utc::now() - r.first_detected_at).num_days();
-                CveTimelineEntry {
-                    cve_id: r.cve_id.unwrap_or_default(),
-                    severity: r.severity.unwrap_or_default(),
-                    affected_component: r.affected_component.unwrap_or_default(),
-                    cve_published_at: None,
-                    first_detected_at: r.first_detected_at,
-                    status: if r.all_acknowledged {
-                        CveStatus::Acknowledged
-                    } else {
-                        CveStatus::Open
-                    },
-                    days_exposed,
-                }
-            })
+            .iter()
+            .map(|r| scan_finding_to_timeline_entry(r, now))
             .collect();
 
         // fixed_cves: union of two definitions, deduped by (artifact_id, cve_id):
@@ -2473,5 +2553,440 @@ mod tests {
             "synth_cve_id must separate fields so concatenation collisions \
              do not yield the same UUID for different inputs"
         );
+    }
+
+    #[test]
+    fn test_synth_cve_id_empty_cve_id() {
+        // Defensive: the mapping in `scan_finding_to_history_entry` passes
+        // an empty cve_id when the row has `None`. The hash must still be
+        // total (not panic) and remain stable.
+        let artifact = Uuid::nil();
+        let a = synth_cve_id(artifact, "");
+        let b = synth_cve_id(artifact, "");
+        assert_eq!(a, b);
+        // And distinct from a non-empty cve_id under the same artifact.
+        let c = synth_cve_id(artifact, "CVE-2019-10744");
+        assert_ne!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure-logic helpers extracted from the DB-coupled CVE history paths.
+    // These are the cases the inline coverage gate counts; the SQL queries
+    // they wrap are unreachable without a live PostgreSQL, so we exercise
+    // the surrounding projection / dedupe / sort logic here. (#1375)
+    // -----------------------------------------------------------------------
+
+    fn make_history_entry(cve_id: &str, first_detected_at: DateTime<Utc>) -> CveHistoryEntry {
+        CveHistoryEntry {
+            id: Uuid::new_v4(),
+            artifact_id: Uuid::new_v4(),
+            sbom_id: None,
+            component_id: None,
+            scan_result_id: None,
+            cve_id: cve_id.to_string(),
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            severity: None,
+            cvss_score: None,
+            cve_published_at: None,
+            first_detected_at,
+            last_detected_at: first_detected_at,
+            status: "open".to_string(),
+            acknowledged_by: None,
+            acknowledged_at: None,
+            acknowledged_reason: None,
+            created_at: first_detected_at,
+            updated_at: first_detected_at,
+        }
+    }
+
+    fn make_scan_row(
+        artifact_id: Uuid,
+        cve_id: Option<&str>,
+        first_detected_at: DateTime<Utc>,
+        all_acknowledged: bool,
+    ) -> ScanFindingCveRow {
+        ScanFindingCveRow {
+            artifact_id,
+            cve_id: cve_id.map(|s| s.to_string()),
+            severity: Some("high".to_string()),
+            affected_component: Some("lodash".to_string()),
+            affected_version: Some("4.17.4".to_string()),
+            fixed_version: Some("4.17.21".to_string()),
+            first_detected_at,
+            last_detected_at: first_detected_at,
+            all_acknowledged,
+        }
+    }
+
+    // --- build_known_cve_set -----------------------------------------------
+
+    #[test]
+    fn test_build_known_cve_set_uppercases() {
+        let entries = vec![
+            make_history_entry("cve-2019-10744", Utc::now()),
+            make_history_entry("CVE-2024-12345", Utc::now()),
+        ];
+        let set = build_known_cve_set(&entries);
+        assert!(set.contains("CVE-2019-10744"));
+        assert!(set.contains("CVE-2024-12345"));
+        // Lower-case form must not appear -- the helper exists *because* we
+        // need a case-insensitive compare downstream.
+        assert!(!set.contains("cve-2019-10744"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_build_known_cve_set_empty_input() {
+        let set = build_known_cve_set(&[]);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_build_known_cve_set_dedupes_case_variants() {
+        // Two curated rows for the same CVE in mixed case must collapse
+        // to one entry in the known set, otherwise the dedupe-by-known
+        // filter on the scan-findings path would behave inconsistently
+        // depending on which case the scanner happened to write.
+        let entries = vec![
+            make_history_entry("cve-2019-10744", Utc::now()),
+            make_history_entry("CVE-2019-10744", Utc::now()),
+        ];
+        let set = build_known_cve_set(&entries);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("CVE-2019-10744"));
+    }
+
+    // --- scan_row_passes_known_filter --------------------------------------
+
+    #[test]
+    fn test_scan_row_passes_known_filter_drops_known_uppercase_match() {
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        // Row matches by upper-case: filtered out.
+        assert!(!scan_row_passes_known_filter(
+            Some("CVE-2019-10744"),
+            &known
+        ));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_drops_known_lowercase_match() {
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        // Row in lower-case still matches: case-insensitive dedupe.
+        assert!(!scan_row_passes_known_filter(
+            Some("cve-2019-10744"),
+            &known
+        ));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_keeps_novel_cve() {
+        let known: HashSet<String> = ["CVE-2019-10744".to_string()].into_iter().collect();
+        assert!(scan_row_passes_known_filter(Some("CVE-2024-12345"), &known));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_drops_none_cve_id() {
+        // Rows with NULL cve_id should be filtered out -- they cannot be
+        // meaningful CVE history entries.
+        let known: HashSet<String> = HashSet::new();
+        assert!(!scan_row_passes_known_filter(None, &known));
+    }
+
+    #[test]
+    fn test_scan_row_passes_known_filter_keeps_when_known_empty() {
+        let known: HashSet<String> = HashSet::new();
+        assert!(scan_row_passes_known_filter(Some("CVE-2019-10744"), &known));
+    }
+
+    // --- status mapping helpers --------------------------------------------
+
+    #[test]
+    fn test_status_string_from_acknowledged() {
+        assert_eq!(status_string_from_acknowledged(true), "acknowledged");
+        assert_eq!(status_string_from_acknowledged(false), "open");
+    }
+
+    #[test]
+    fn test_status_enum_from_acknowledged() {
+        assert_eq!(status_enum_from_acknowledged(true), CveStatus::Acknowledged);
+        assert_eq!(status_enum_from_acknowledged(false), CveStatus::Open);
+    }
+
+    #[test]
+    fn test_status_mappings_are_consistent() {
+        // Whatever the string variant says, the enum variant must match
+        // (else trends timeline and history list would disagree on the
+        // same scan_findings row).
+        assert_eq!(
+            status_string_from_acknowledged(true),
+            status_enum_from_acknowledged(true).as_str()
+        );
+        assert_eq!(
+            status_string_from_acknowledged(false),
+            status_enum_from_acknowledged(false).as_str()
+        );
+    }
+
+    // --- scan_finding_to_history_entry -------------------------------------
+
+    #[test]
+    fn test_scan_finding_to_history_entry_basic_mapping() {
+        let when = Utc::now();
+        let artifact = Uuid::new_v4();
+        let row = make_scan_row(artifact, Some("CVE-2019-10744"), when, false);
+        let entry = scan_finding_to_history_entry(row);
+
+        assert_eq!(entry.artifact_id, artifact);
+        assert_eq!(entry.cve_id, "CVE-2019-10744");
+        assert_eq!(entry.severity.as_deref(), Some("high"));
+        assert_eq!(entry.affected_component.as_deref(), Some("lodash"));
+        assert_eq!(entry.affected_version.as_deref(), Some("4.17.4"));
+        assert_eq!(entry.fixed_version.as_deref(), Some("4.17.21"));
+        assert_eq!(entry.first_detected_at, when);
+        assert_eq!(entry.last_detected_at, when);
+        assert_eq!(entry.status, "open");
+        assert_eq!(entry.created_at, when);
+        assert_eq!(entry.updated_at, when);
+        // Synthetic rows carry no FK references.
+        assert!(entry.sbom_id.is_none());
+        assert!(entry.component_id.is_none());
+        assert!(entry.scan_result_id.is_none());
+        assert!(entry.acknowledged_by.is_none());
+        assert!(entry.acknowledged_at.is_none());
+        assert!(entry.acknowledged_reason.is_none());
+        assert!(entry.cvss_score.is_none());
+        assert!(entry.cve_published_at.is_none());
+        // The id must equal synth_cve_id for the same inputs (stable across re-reads).
+        assert_eq!(entry.id, synth_cve_id(artifact, "CVE-2019-10744"));
+    }
+
+    #[test]
+    fn test_scan_finding_to_history_entry_acknowledged_status() {
+        let row = make_scan_row(Uuid::new_v4(), Some("CVE-2024-12345"), Utc::now(), true);
+        let entry = scan_finding_to_history_entry(row);
+        assert_eq!(entry.status, "acknowledged");
+    }
+
+    #[test]
+    fn test_scan_finding_to_history_entry_none_cve_id_defaults_to_empty() {
+        // Defensive: the upstream filter should drop rows with NULL cve_id,
+        // but if anything slips through the mapping must remain total and
+        // produce a usable (if empty-id) row rather than panicking.
+        let row = make_scan_row(Uuid::new_v4(), None, Utc::now(), false);
+        let entry = scan_finding_to_history_entry(row);
+        assert_eq!(entry.cve_id, "");
+    }
+
+    // --- scan_finding_to_timeline_entry ------------------------------------
+
+    #[test]
+    fn test_scan_finding_to_timeline_entry_days_exposed() {
+        let now = Utc::now();
+        // 10 days ago
+        let first = now - chrono::Duration::days(10);
+        let row = make_scan_row(Uuid::new_v4(), Some("CVE-2019-10744"), first, false);
+        let t = scan_finding_to_timeline_entry(&row, now);
+        assert_eq!(t.days_exposed, 10);
+        assert_eq!(t.cve_id, "CVE-2019-10744");
+        assert_eq!(t.severity, "high");
+        assert_eq!(t.affected_component, "lodash");
+        assert_eq!(t.status, CveStatus::Open);
+        assert_eq!(t.first_detected_at, first);
+        assert!(t.cve_published_at.is_none());
+    }
+
+    #[test]
+    fn test_scan_finding_to_timeline_entry_acknowledged_status() {
+        let now = Utc::now();
+        let row = make_scan_row(Uuid::new_v4(), Some("CVE-2024-12345"), now, true);
+        let t = scan_finding_to_timeline_entry(&row, now);
+        assert_eq!(t.status, CveStatus::Acknowledged);
+        assert_eq!(t.days_exposed, 0);
+    }
+
+    #[test]
+    fn test_scan_finding_to_timeline_entry_handles_none_fields() {
+        let now = Utc::now();
+        let row = ScanFindingCveRow {
+            artifact_id: Uuid::new_v4(),
+            cve_id: None,
+            severity: None,
+            affected_component: None,
+            affected_version: None,
+            fixed_version: None,
+            first_detected_at: now,
+            last_detected_at: now,
+            all_acknowledged: false,
+        };
+        let t = scan_finding_to_timeline_entry(&row, now);
+        // None fields default to empty strings in the DTO.
+        assert_eq!(t.cve_id, "");
+        assert_eq!(t.severity, "");
+        assert_eq!(t.affected_component, "");
+    }
+
+    // --- filter_entries_by_repo_map ----------------------------------------
+
+    #[test]
+    fn test_filter_entries_by_repo_map_keeps_only_allowed() {
+        let artifact_a = Uuid::new_v4();
+        let artifact_b = Uuid::new_v4();
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+
+        let mut e1 = make_history_entry("CVE-1", Utc::now());
+        e1.artifact_id = artifact_a;
+        let mut e2 = make_history_entry("CVE-2", Utc::now());
+        e2.artifact_id = artifact_b;
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(artifact_a, repo_a);
+        map.insert(artifact_b, repo_b);
+
+        let allowed: HashSet<Uuid> = [repo_a].into_iter().collect();
+        let filtered = filter_entries_by_repo_map(vec![e1, e2], &map, &allowed);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].cve_id, "CVE-1");
+        assert_eq!(filtered[0].artifact_id, artifact_a);
+    }
+
+    #[test]
+    fn test_filter_entries_by_repo_map_drops_entry_with_unknown_artifact() {
+        // Defensive: if the DB lookup is partial (e.g. artifact was deleted
+        // mid-request, so `is_deleted` filter excluded it), the entry must
+        // be dropped rather than leaked to the caller.
+        let artifact_a = Uuid::new_v4();
+        let mut e1 = make_history_entry("CVE-1", Utc::now());
+        e1.artifact_id = artifact_a;
+        let map = std::collections::HashMap::new(); // empty: artifact not present
+        let allowed: HashSet<Uuid> = [Uuid::new_v4()].into_iter().collect();
+        let filtered = filter_entries_by_repo_map(vec![e1], &map, &allowed);
+        assert!(
+            filtered.is_empty(),
+            "entries with unknown repo must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_filter_entries_by_repo_map_empty_input() {
+        let map = std::collections::HashMap::new();
+        let allowed: HashSet<Uuid> = HashSet::new();
+        let filtered = filter_entries_by_repo_map(vec![], &map, &allowed);
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_filter_entries_by_repo_map_empty_allowed_set_drops_all() {
+        // An empty allowed set must drop everything (the caller passed an
+        // explicit empty allowlist, not None -- different contract).
+        let artifact_a = Uuid::new_v4();
+        let repo_a = Uuid::new_v4();
+        let mut e1 = make_history_entry("CVE-1", Utc::now());
+        e1.artifact_id = artifact_a;
+        let mut map = std::collections::HashMap::new();
+        map.insert(artifact_a, repo_a);
+        let allowed: HashSet<Uuid> = HashSet::new();
+        let filtered = filter_entries_by_repo_map(vec![e1], &map, &allowed);
+        assert!(filtered.is_empty());
+    }
+
+    // --- sort_entries_by_first_detected_desc -------------------------------
+
+    #[test]
+    fn test_sort_entries_by_first_detected_desc_newest_first() {
+        let now = Utc::now();
+        let old = make_history_entry("CVE-OLD", now - chrono::Duration::days(30));
+        let mid = make_history_entry("CVE-MID", now - chrono::Duration::days(10));
+        let new = make_history_entry("CVE-NEW", now);
+        // Deliberately scrambled.
+        let mut entries = vec![old, new, mid];
+        sort_entries_by_first_detected_desc(&mut entries);
+        assert_eq!(entries[0].cve_id, "CVE-NEW");
+        assert_eq!(entries[1].cve_id, "CVE-MID");
+        assert_eq!(entries[2].cve_id, "CVE-OLD");
+    }
+
+    #[test]
+    fn test_sort_entries_by_first_detected_desc_empty_input() {
+        let mut entries: Vec<CveHistoryEntry> = vec![];
+        sort_entries_by_first_detected_desc(&mut entries);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_sort_entries_by_first_detected_desc_stable_for_equal_timestamps() {
+        let when = Utc::now();
+        let a = make_history_entry("CVE-A", when);
+        let b = make_history_entry("CVE-B", when);
+        let mut entries = vec![a.clone(), b.clone()];
+        sort_entries_by_first_detected_desc(&mut entries);
+        // Both have the same first_detected_at -- the sort is total but the
+        // relative order of equals is preserved by sort_by_key (Rust's slice
+        // sort is stable). Don't rely on which comes first; rely on both
+        // still being present.
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.cve_id == "CVE-A"));
+        assert!(entries.iter().any(|e| e.cve_id == "CVE-B"));
+    }
+
+    // --- end-to-end pipeline check (pure, no DB) ---------------------------
+
+    #[test]
+    fn test_scan_finding_dedupe_then_merge_then_sort() {
+        // Simulate the full read pipeline in `get_cve_history` against an
+        // in-memory dataset: curated rows + scan rows, dedupe by cve_id,
+        // sort newest-first.
+        let now = Utc::now();
+        let artifact = Uuid::new_v4();
+
+        // Curated row (older, "CVE-2019-10744" upper-case).
+        let curated = make_history_entry("CVE-2019-10744", now - chrono::Duration::days(20));
+
+        // Scan rows: one is a case-variant duplicate of the curated CVE
+        // (must be dropped), one is novel (must survive).
+        let dup_row = make_scan_row(
+            artifact,
+            Some("cve-2019-10744"), // lower-case duplicate
+            now - chrono::Duration::days(5),
+            false,
+        );
+        let novel_row = make_scan_row(
+            artifact,
+            Some("CVE-2024-12345"),
+            now - chrono::Duration::days(1),
+            false,
+        );
+
+        // Step 1: known set from curated rows.
+        let known = build_known_cve_set(std::slice::from_ref(&curated));
+        assert_eq!(known.len(), 1);
+
+        // Step 2: apply dedupe filter to scan rows.
+        let scan_rows = vec![dup_row, novel_row];
+        let kept: Vec<_> = scan_rows
+            .into_iter()
+            .filter(|r| scan_row_passes_known_filter(r.cve_id.as_deref(), &known))
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "case-insensitive dedupe must drop the lower-case duplicate"
+        );
+        assert_eq!(kept[0].cve_id.as_deref(), Some("CVE-2024-12345"));
+
+        // Step 3: project scan rows to CveHistoryEntry.
+        let mut combined: Vec<CveHistoryEntry> = vec![curated];
+        combined.extend(kept.into_iter().map(scan_finding_to_history_entry));
+
+        // Step 4: sort newest-first.
+        sort_entries_by_first_detected_desc(&mut combined);
+
+        // The novel scan row was detected 1 day ago, the curated row 20
+        // days ago, so the scan row sorts first.
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0].cve_id, "CVE-2024-12345");
+        assert_eq!(combined[1].cve_id, "CVE-2019-10744");
     }
 }
