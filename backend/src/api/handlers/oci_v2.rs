@@ -747,37 +747,48 @@ fn normalize_docker_image(image: &str, upstream_url: &str) -> String {
     }
 }
 
+/// Build the list of upstream image names to try when fetching a blob /
+/// manifest from a remote member.
+///
+/// For Docker Hub, official images are only addressable under the
+/// `library/` namespace (e.g. `library/alpine`, never bare `alpine`). The
+/// previous implementation appended a non-`library/` fallback, which
+/// caused every cache-miss against Docker Hub to issue **two** upstream
+/// HTTP requests per member: one for `library/alpine`, then one for
+/// `alpine`. Reviewer flagged this on PR #1348 (round 1, concern #1).
+///
+/// The fix is to return a single canonical candidate when the upstream is
+/// Docker Hub. For non-Docker-Hub registries (GHCR, ECR, Quay, internal
+/// mirrors) we keep the previous behaviour of returning the image
+/// verbatim, since those registries do not have a `library/` convention.
 fn candidate_upstream_images(image: &str, upstream_url: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-
-    let normalized = normalize_docker_image(image, upstream_url);
-    if !normalized.is_empty() {
-        candidates.push(normalized);
+    if image.is_empty() {
+        return Vec::new();
     }
 
-    if !image.is_empty() && !candidates.iter().any(|candidate| candidate == image) {
-        candidates.push(image.to_string());
+    if is_docker_hub(upstream_url) {
+        // Docker Hub: only the `library/`-normalized form is correct. Trying
+        // the bare name as a fallback wastes a round-trip; Docker Hub does
+        // not serve official images at `/v2/{name}/...` without the
+        // `library/` prefix.
+        return vec![normalize_docker_image(image, upstream_url)];
     }
 
-    if let Some(stripped) = image.strip_prefix("library/") {
-        if !stripped.is_empty() && !candidates.iter().any(|candidate| candidate == stripped) {
-            candidates.push(stripped.to_string());
-        }
-    } else if !image.contains('/') {
-        let with_library = format!("library/{}", image);
-        if !candidates.iter().any(|candidate| candidate == &with_library) {
-            candidates.push(with_library);
-        }
-    }
-
-    candidates
+    // Non-Docker-Hub: single candidate, the image as given.
+    vec![image.to_string()]
 }
 
-enum VirtualBlobResolution {
+/// Where (and how) a virtual-repo blob was found.
+///
+/// `Local` carries the owning member's full `Repository`, boxed to keep
+/// the variant from inflating the enum's discriminant footprint to
+/// 336+ bytes when every other variant is ~56 bytes
+/// (clippy::large_enum_variant).
+pub enum VirtualBlobResolution {
     Local {
         size_bytes: i64,
         storage_key: String,
-        member: crate::models::repository::Repository,
+        member: Box<crate::models::repository::Repository>,
     },
     Remote {
         content: Bytes,
@@ -785,12 +796,127 @@ enum VirtualBlobResolution {
     },
 }
 
-async fn resolve_virtual_blob(
+// ---------------------------------------------------------------------------
+// Virtual-resolution negative cache (#1348 round 1, concern #2)
+// ---------------------------------------------------------------------------
+//
+// `resolve_virtual_blob` / `resolve_virtual_manifest` walk each remote
+// member in turn. When a virtual repo has N remote members and none of
+// them serve the requested blob (a common case for digest probes from
+// Docker pull retries), the resolver issues N upstream HTTP round-trips
+// **serially** before returning None, and then the next probe a few ms
+// later does it all over again.
+//
+// To bound the blast radius without changing the resolver's correctness
+// for hits, we keep a short-TTL ("a few seconds") in-process negative
+// cache keyed by `(repo_id, image, reference)`. Hits short-circuit
+// straight to None; the entry expires quickly so a real upstream
+// publishing event is not blocked for long.
+//
+// The cache is intentionally process-local (no Redis, no DB) — it's a
+// micro-optimisation, not a correctness primitive. Restarting the
+// process or scaling out re-pays the upstream walk once.
+const VIRTUAL_NEGATIVE_CACHE_TTL_MS: u64 = 5_000;
+const VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES: usize = 4096;
+
+#[derive(Eq, Hash, PartialEq, Clone)]
+struct VirtualResolveKey {
+    repo_id: Uuid,
+    kind: VirtualResolveKind,
+    image: String,
+    reference: String,
+}
+
+#[derive(Eq, Hash, PartialEq, Clone, Copy)]
+enum VirtualResolveKind {
+    Blob,
+    Manifest,
+}
+
+fn virtual_negative_cache(
+) -> &'static std::sync::RwLock<std::collections::HashMap<VirtualResolveKey, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<VirtualResolveKey, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Returns true if a recent resolution attempt for this `(repo_id, kind,
+/// image, reference)` returned None, and the entry has not yet expired.
+fn virtual_negative_cache_hit(key: &VirtualResolveKey) -> bool {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+    let cache = virtual_negative_cache();
+    let read = match cache.read() {
+        Ok(g) => g,
+        Err(_) => return false, // poisoned: behave as miss
+    };
+    match read.get(key) {
+        Some(at) => now.duration_since(*at) < ttl,
+        None => false,
+    }
+}
+
+/// Record a None resolution. Best-effort: lock poisoning silently degrades
+/// to "no caching", which is still correct, just slower.
+fn virtual_negative_cache_insert(key: VirtualResolveKey) {
+    let cache = virtual_negative_cache();
+    let mut write = match cache.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    // Cheap bound: if the map has grown past the cap, drop expired entries
+    // first, and if that doesn't free space, refuse the insert. We never
+    // want this cache to behave as a memory leak under pathological probe
+    // loads.
+    if write.len() >= VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES {
+        let ttl = std::time::Duration::from_millis(VIRTUAL_NEGATIVE_CACHE_TTL_MS);
+        let now = std::time::Instant::now();
+        write.retain(|_, at| now.duration_since(*at) < ttl);
+        if write.len() >= VIRTUAL_NEGATIVE_CACHE_MAX_ENTRIES {
+            return;
+        }
+    }
+    write.insert(key, std::time::Instant::now());
+}
+
+/// Test-only: drop all negative-cache entries. Exposed to the
+/// integration test crate so tests can run in any order without
+/// stale-cache contamination.
+#[doc(hidden)]
+pub fn virtual_negative_cache_clear() {
+    if let Ok(mut g) = virtual_negative_cache().write() {
+        g.clear();
+    }
+}
+
+/// Walk a virtual OCI repo's members in priority order, returning the
+/// first one (local or remote) that serves the requested blob digest.
+///
+/// Exposed as `pub` so the integration tests in
+/// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
+/// upstream HTTP path. Handlers reach for this via the inline call
+/// site, not directly through the public API.
+pub async fn resolve_virtual_blob(
     state: &SharedState,
     repo_id: Uuid,
     image_name: &str,
     digest: &str,
 ) -> Option<VirtualBlobResolution> {
+    // #1348 round 1, concern #2: short-circuit when we very recently saw
+    // none of the members serve this blob. Bounds the cost of probe
+    // storms (e.g. Docker pull retry loops) against a virtual repo with
+    // many remote members.
+    let cache_key = VirtualResolveKey {
+        repo_id,
+        kind: VirtualResolveKind::Blob,
+        image: image_name.to_string(),
+        reference: digest.to_string(),
+    };
+    if virtual_negative_cache_hit(&cache_key) {
+        return None;
+    }
+
     let members = proxy_helpers::fetch_virtual_members(&state.db, repo_id)
         .await
         .ok()?;
@@ -810,7 +936,7 @@ async fn resolve_virtual_blob(
             return Some(VirtualBlobResolution::Local {
                 size_bytes: blob.size_bytes,
                 storage_key: blob.storage_key,
-                member: member.clone(),
+                member: Box::new(member.clone()),
             });
         }
 
@@ -829,6 +955,21 @@ async fn resolve_virtual_blob(
                     )
                     .await
                     {
+                        // #1348 round 1, concern #3 (digest verification):
+                        // for blobs the requested `digest` is always a
+                        // content-addressable digest. Verify upstream
+                        // content matches before serving it; otherwise
+                        // we would happily relay corrupt or tampered
+                        // bytes to the client under the wrong digest.
+                        // `compute_sha256` returns the `sha256:`-prefixed
+                        // form, matching the OCI digest grammar.
+                        if is_digest_reference(digest) && compute_sha256(&content) != digest {
+                            warn!(
+                                "Virtual blob digest mismatch from upstream {} for {}: refusing to serve",
+                                upstream_url, digest
+                            );
+                            continue;
+                        }
                         return Some(VirtualBlobResolution::Remote {
                             content,
                             content_type,
@@ -839,10 +980,23 @@ async fn resolve_virtual_blob(
         }
     }
 
+    virtual_negative_cache_insert(cache_key);
     None
 }
 
-async fn resolve_virtual_manifest(
+/// Walk a virtual OCI repo's members in priority order, returning the
+/// first one (local or remote) that serves the requested manifest.
+///
+/// When `reference` is itself a content-addressable digest, the upstream
+/// body is sha256-verified against the requested digest before being
+/// returned (#1348 round 1, concern #3). A mismatch is treated as if
+/// that member did not have the manifest, so resolution continues with
+/// the next member.
+///
+/// Exposed as `pub` so the integration tests in
+/// `tests/oci_virtual_resolution_tests.rs` can exercise the real DB +
+/// upstream HTTP path.
+pub async fn resolve_virtual_manifest(
     state: &SharedState,
     repo_id: Uuid,
     image_name: &str,
@@ -850,6 +1004,20 @@ async fn resolve_virtual_manifest(
     accept: Option<&str>,
 ) -> Option<(String, Option<String>, Bytes)> {
     let is_digest_ref = is_digest_reference(reference);
+
+    // #1348 round 1, concern #2: same negative-cache short-circuit as
+    // `resolve_virtual_blob`. Tags vs digest references share the cache
+    // because tag probes are themselves a common N-member fan-out.
+    let cache_key = VirtualResolveKey {
+        repo_id,
+        kind: VirtualResolveKind::Manifest,
+        image: image_name.to_string(),
+        reference: reference.to_string(),
+    };
+    if virtual_negative_cache_hit(&cache_key) {
+        return None;
+    }
+
     let members = proxy_helpers::fetch_virtual_members(&state.db, repo_id)
         .await
         .ok()?;
@@ -905,14 +1073,34 @@ async fn resolve_virtual_manifest(
                     )
                     .await
                     {
-                        let digest = compute_sha256(&content);
-                        return Some((digest, content_type, content));
+                        // #1348 round 1, concern #3 (CRITICAL):
+                        // When the manifest reference is itself a digest
+                        // (e.g. `sha256:abc...`) the client is asserting
+                        // content-addressable semantics. The previous
+                        // code computed `compute_sha256(content)` and
+                        // returned it as `manifest_digest` *without*
+                        // checking against the requested reference, so a
+                        // compromised or misbehaving upstream could
+                        // serve arbitrary bytes under the requested
+                        // digest. Verify and reject mismatches.
+                        // `compute_sha256` returns the `sha256:`-prefixed
+                        // form, matching the OCI digest grammar.
+                        let computed = compute_sha256(&content);
+                        if is_digest_ref && computed != reference {
+                            warn!(
+                                "Virtual manifest digest mismatch from upstream {} for {} (computed {}): refusing to serve",
+                                upstream_url, reference, computed
+                            );
+                            continue;
+                        }
+                        return Some((computed, content_type, content));
                     }
                 }
             }
         }
     }
 
+    virtual_negative_cache_insert(cache_key);
     None
 }
 
@@ -1506,7 +1694,11 @@ async fn handle_head_blob(
     if repo.repo_type == RepositoryType::Virtual {
         if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
             return match resolution {
-                VirtualBlobResolution::Local { size_bytes, storage_key, member } => {
+                VirtualBlobResolution::Local {
+                    size_bytes,
+                    storage_key,
+                    member,
+                } => {
                     let storage = match state.storage_for_repo(&member.storage_location()) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1529,7 +1721,10 @@ async fn handle_head_blob(
                         oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "blob not found")
                     }
                 }
-                VirtualBlobResolution::Remote { content, content_type } => build_oci_proxy_response(
+                VirtualBlobResolution::Remote {
+                    content,
+                    content_type,
+                } => build_oci_proxy_response(
                     &content,
                     content_type,
                     digest,
@@ -1624,7 +1819,11 @@ async fn handle_get_blob(
     if repo.repo_type == RepositoryType::Virtual {
         if let Some(resolution) = resolve_virtual_blob(state, repo.id, &repo.image, digest).await {
             return match resolution {
-                VirtualBlobResolution::Local { storage_key, member, .. } => {
+                VirtualBlobResolution::Local {
+                    storage_key,
+                    member,
+                    ..
+                } => {
                     let storage = match state.storage_for_repo(&member.storage_location()) {
                         Ok(s) => s,
                         Err(e) => {
@@ -1649,7 +1848,10 @@ async fn handle_get_blob(
                         }
                     }
                 }
-                VirtualBlobResolution::Remote { content, content_type } => build_oci_proxy_response(
+                VirtualBlobResolution::Remote {
+                    content,
+                    content_type,
+                } => build_oci_proxy_response(
                     &content,
                     content_type,
                     digest,
@@ -5287,18 +5489,24 @@ mod tests {
     }
 
     #[test]
-    fn test_candidate_upstream_images_prefers_normalized_docker_hub_name() {
+    fn test_candidate_upstream_images_returns_single_normalized_docker_hub_name() {
+        // Bare official image: only `library/alpine` should be tried.
+        // The pre-fix code returned ["library/alpine", "alpine"], causing
+        // two upstream round-trips per cache miss (#1348 round 1).
         assert_eq!(
             super::candidate_upstream_images("alpine", "https://registry-1.docker.io"),
-            vec!["library/alpine".to_string(), "alpine".to_string()]
+            vec!["library/alpine".to_string()]
         );
     }
 
     #[test]
-    fn test_candidate_upstream_images_handles_library_prefix_variants() {
+    fn test_candidate_upstream_images_keeps_library_prefix_single_candidate() {
+        // Caller already passed `library/alpine` — no need to also try
+        // bare `alpine`. Docker Hub does not serve official images at the
+        // bare name.
         assert_eq!(
             super::candidate_upstream_images("library/alpine", "https://registry-1.docker.io"),
-            vec!["library/alpine".to_string(), "alpine".to_string()]
+            vec!["library/alpine".to_string()]
         );
     }
 
@@ -5307,6 +5515,22 @@ mod tests {
         assert_eq!(
             super::candidate_upstream_images("org/app", "https://ghcr.io"),
             vec!["org/app".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_empty_image_returns_empty() {
+        assert!(super::candidate_upstream_images("", "https://registry-1.docker.io").is_empty());
+        assert!(super::candidate_upstream_images("", "https://ghcr.io").is_empty());
+    }
+
+    #[test]
+    fn test_candidate_upstream_images_non_official_docker_hub_user_image() {
+        // `bitnami/postgres` on Docker Hub is already correctly namespaced;
+        // no `library/` prefix should be injected.
+        assert_eq!(
+            super::candidate_upstream_images("bitnami/postgres", "https://registry-1.docker.io"),
+            vec!["bitnami/postgres".to_string()]
         );
     }
 
