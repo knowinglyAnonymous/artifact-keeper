@@ -8173,10 +8173,13 @@ mod tests {
             "generic",
             serde_json::json!({ "repo_type": "virtual" }),
         );
+        // Post-#1438 `create_repository` takes `body: Bytes` so auth runs
+        // before body deserialisation. `make_create_request` already returns
+        // `Bytes`; pass it through directly (no `Json(...)` wrapper).
         let create_result = create_repository(
             State(state.clone()),
             Extension(Some(admin_auth(user_id, &username))),
-            Json(payload),
+            payload,
         )
         .await;
         // The whole point of #1444 is that this NO LONGER returns 400.
