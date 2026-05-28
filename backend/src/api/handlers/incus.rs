@@ -2020,8 +2020,7 @@ mod tests {
         let repo_id = Uuid::new_v4();
         let artifact_path = build_artifact_path("ubuntu-noble", "20240215", "incus.tar.gz");
         let storage_key = build_storage_key(&repo_id, &artifact_path);
-        let final_path =
-            storage_path_for_key(tmp.to_str().unwrap(), &storage_key);
+        let final_path = storage_path_for_key(tmp.to_str().unwrap(), &storage_key);
 
         // Simulate what upload_image / complete_chunked_upload do after
         // finalize_temp_file: create parent dirs, write the payload.

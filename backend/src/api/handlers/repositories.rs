@@ -1530,6 +1530,82 @@ pub async fn list_artifacts(
 /// Extracted from the inline listing loop so it can be unit-tested
 /// without a database. Pure transformation of `Artifact` fields plus
 /// the precomputed download count.
+/// Return the ordered list of paths to try when looking up an artifact
+/// by path under a repo of the given format.
+///
+/// The literal request path is always tried first so non-npm formats
+/// and already-stored paths keep working unchanged. For npm-family
+/// repos a second candidate is appended whenever the request path
+/// matches the canonical npm tarball URL shape
+/// (`<name>/-/<name>-<version>.tgz`); that second candidate is the
+/// version-segmented stored shape produced by `store_npm_version`. See
+/// #1443.
+///
+/// Returned without duplicates: if the literal path is already the
+/// stored shape (or `normalize_lookup_path` returns the same string),
+/// only one DB query runs.
+fn lookup_path_candidates(path: &str, format: &RepositoryFormat) -> Vec<String> {
+    let mut out = vec![path.to_string()];
+    if is_npm_family_format(format) {
+        if let Some(normalized) = crate::formats::npm::normalize_lookup_path(path) {
+            if normalized != path {
+                out.push(normalized);
+            }
+        }
+    }
+    out
+}
+
+/// npm-family formats share the publish/download path conventions of
+/// the npm registry (`yarn`, `pnpm`, and `bower` all wrap the same
+/// upstream wire format). Keep this in sync with the `format` mapping
+/// in `parse_format` and with the publish handler in
+/// `api::handlers::npm`.
+fn is_npm_family_format(format: &RepositoryFormat) -> bool {
+    matches!(
+        format,
+        RepositoryFormat::Npm
+            | RepositoryFormat::Yarn
+            | RepositoryFormat::Bower
+            | RepositoryFormat::Pnpm
+    )
+}
+
+/// Try each candidate path in order, returning the first match. Skips
+/// soft-deleted rows. Used by `get_artifact_metadata` so the npm
+/// lookup-by-URL fallback only costs an extra DB roundtrip on a true
+/// cache miss.
+async fn lookup_artifact_by_paths(
+    db: &sqlx::PgPool,
+    repository_id: Uuid,
+    candidates: &[String],
+) -> Result<Option<crate::models::artifact::Artifact>> {
+    for candidate in candidates {
+        let found = sqlx::query_as!(
+            crate::models::artifact::Artifact,
+            r#"
+            SELECT
+                id, repository_id, path, name, version, size_bytes,
+                checksum_sha256, checksum_md5, checksum_sha1,
+                content_type, storage_key, is_deleted, uploaded_by,
+                quarantine_status, quarantine_until,
+                created_at, updated_at
+            FROM artifacts
+            WHERE repository_id = $1 AND path = $2 AND is_deleted = false
+            "#,
+            repository_id,
+            candidate
+        )
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        if found.is_some() {
+            return Ok(found);
+        }
+    }
+    Ok(None)
+}
+
 fn build_artifact_response(
     artifact: &crate::models::artifact::Artifact,
     repo_key: &str,
@@ -2180,25 +2256,21 @@ pub async fn get_artifact_metadata(
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
 
-    let artifact = sqlx::query_as!(
-        crate::models::artifact::Artifact,
-        r#"
-        SELECT
-            id, repository_id, path, name, version, size_bytes,
-            checksum_sha256, checksum_md5, checksum_sha1,
-            content_type, storage_key, is_deleted, uploaded_by,
-            quarantine_status, quarantine_until,
-            created_at, updated_at
-        FROM artifacts
-        WHERE repository_id = $1 AND path = $2 AND is_deleted = false
-        "#,
-        repo.id,
-        path
-    )
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Database(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
+    // #1443: npm publish stores tarballs under
+    // `<name>/<version>/<name>-<version>.tgz` (see
+    // `api::handlers::npm::store_npm_version`), but external callers
+    // (release-gate smoke test, JFrog/Artifactory-style consumers,
+    // webhook payloads) carry the canonical npm download-URL shape
+    // `<name>/-/<name>-<version>.tgz`. Without translating the request
+    // path, an exact-match lookup against `artifacts.path` never finds
+    // the row. Try the literal path first (so non-npm formats and
+    // already-stored npm paths still work), then fall back to the
+    // normalised stored shape for npm-family repos when the caller
+    // handed us the URL shape.
+    let candidates = lookup_path_candidates(&path, &repo.format);
+    let artifact = lookup_artifact_by_paths(&state.db, repo.id, &candidates)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Artifact not found".to_string()))?;
 
     let downloads = artifact_service.get_download_stats(artifact.id).await?;
     let metadata = artifact_service.get_metadata(artifact.id).await?;
@@ -7900,5 +7972,121 @@ mod tests {
             matches!(err, AppError::Authorization(_)),
             "non-admin plugin-format creation must surface as Authorization (403), got {err:?}",
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1443 regression: lookup_path_candidates + is_npm_family_format
+    //
+    // npm publish stores tarballs under the version-segmented shape, but
+    // external callers (release-gate smoke test, JFrog-compatible
+    // tooling) supply the canonical npm download-URL shape
+    // (`<name>/-/<name>-<version>.tgz`). `get_artifact_metadata` walks
+    // this list of candidates so the literal request always wins for
+    // formats that don't normalise, and npm-family repos quietly fall
+    // back to the stored path on the second probe.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_path_candidates_npm_url_shape_adds_stored_fallback() {
+        let candidates =
+            lookup_path_candidates("rfs-pkg/-/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "rfs-pkg/-/rfs-pkg-1.0.0.tgz".to_string(),
+                "rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_scoped_url_shape() {
+        let candidates =
+            lookup_path_candidates("@angular/core/-/core-17.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec![
+                "@angular/core/-/core-17.0.0.tgz".to_string(),
+                "@angular/core/17.0.0/core-17.0.0.tgz".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_stored_shape_passthrough() {
+        // When the caller already supplies the stored shape,
+        // normalize_lookup_path returns None and we issue exactly one
+        // query against the literal path.
+        let candidates =
+            lookup_path_candidates("rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz", &RepositoryFormat::Npm);
+        assert_eq!(
+            candidates,
+            vec!["rfs-pkg/1.0.0/rfs-pkg-1.0.0.tgz".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_npm_metadata_path_not_rewritten() {
+        // package.json / packument paths don't end in .tgz so
+        // normalize_lookup_path returns None and only the literal path
+        // is tried.
+        let candidates = lookup_path_candidates("lodash/package.json", &RepositoryFormat::Npm);
+        assert_eq!(candidates, vec!["lodash/package.json".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_non_npm_format_unchanged() {
+        // Maven repos must never have their paths rewritten by the npm
+        // normaliser, even if a path coincidentally matches `/-/` (it
+        // doesn't here, but the guard fires before normalisation
+        // anyway).
+        let candidates =
+            lookup_path_candidates("com/example/lib/1.0/lib-1.0.jar", &RepositoryFormat::Maven);
+        assert_eq!(
+            candidates,
+            vec!["com/example/lib/1.0/lib-1.0.jar".to_string()]
+        );
+
+        // And even a path that looks npm-shaped is left alone outside
+        // npm-family repos.
+        let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &RepositoryFormat::Generic);
+        assert_eq!(candidates, vec!["foo/-/foo-1.0.0.tgz".to_string()]);
+    }
+
+    #[test]
+    fn test_lookup_path_candidates_yarn_pnpm_bower_apply_normalisation() {
+        // Yarn, pnpm, and bower all wrap the npm wire format. They
+        // share the publish/download layout so the same normalisation
+        // must fire for them.
+        for fmt in [
+            RepositoryFormat::Yarn,
+            RepositoryFormat::Pnpm,
+            RepositoryFormat::Bower,
+        ] {
+            let candidates = lookup_path_candidates("foo/-/foo-1.0.0.tgz", &fmt);
+            assert_eq!(
+                candidates,
+                vec![
+                    "foo/-/foo-1.0.0.tgz".to_string(),
+                    "foo/1.0.0/foo-1.0.0.tgz".to_string(),
+                ],
+                "format {fmt:?} must inherit npm path normalisation",
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_npm_family_format_membership() {
+        assert!(is_npm_family_format(&RepositoryFormat::Npm));
+        assert!(is_npm_family_format(&RepositoryFormat::Yarn));
+        assert!(is_npm_family_format(&RepositoryFormat::Pnpm));
+        assert!(is_npm_family_format(&RepositoryFormat::Bower));
+        // Negative cases: every format outside the npm wire-protocol
+        // family must NOT inherit npm path normalisation.
+        assert!(!is_npm_family_format(&RepositoryFormat::Maven));
+        assert!(!is_npm_family_format(&RepositoryFormat::Pypi));
+        assert!(!is_npm_family_format(&RepositoryFormat::Docker));
+        assert!(!is_npm_family_format(&RepositoryFormat::Generic));
+        assert!(!is_npm_family_format(&RepositoryFormat::Cargo));
     }
 }
