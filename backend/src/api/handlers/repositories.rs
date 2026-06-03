@@ -1896,15 +1896,8 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
-        // #1542 added these required fields to ArtifactResponse after #1567
-        // introduced this initializer, so the two landed together and broke
-        // the build. This entry is, by construction, a live proxy-cache
-        // object, so its cache-freshness timestamp is exactly when it was
-        // cached. The listing's sidecar projection (`CachedArtifactEntry`)
-        // doesn't carry the expiry, so leave `cache_expires_at` to the
-        // per-artifact metadata endpoint (#1541). Both fields are
-        // `#[serde(skip_serializing_if = "Option::is_none")]`, so the listing
-        // wire shape is unchanged for callers that don't read them.
+        // This is a proxy-cache entry, so surface the cache timestamp.
+        // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
         cache_cached_at: Some(entry.cached_at),
         cache_expires_at: None,
     }
