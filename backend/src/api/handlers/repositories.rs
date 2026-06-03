@@ -1896,6 +1896,17 @@ fn build_cached_artifact_response(
         download_count: 0,
         created_at: entry.cached_at,
         metadata: None,
+        // #1542 added these required fields to ArtifactResponse after #1567
+        // introduced this initializer, so the two landed together and broke
+        // the build. This entry is, by construction, a live proxy-cache
+        // object, so its cache-freshness timestamp is exactly when it was
+        // cached. The listing's sidecar projection (`CachedArtifactEntry`)
+        // doesn't carry the expiry, so leave `cache_expires_at` to the
+        // per-artifact metadata endpoint (#1541). Both fields are
+        // `#[serde(skip_serializing_if = "Option::is_none")]`, so the listing
+        // wire shape is unchanged for callers that don't read them.
+        cache_cached_at: Some(entry.cached_at),
+        cache_expires_at: None,
     }
 }
 
@@ -4403,6 +4414,12 @@ mod tests {
         assert_eq!(resp.checksum_sha256, "deadbeef");
         assert_eq!(resp.download_count, 0);
         assert!(resp.version.is_none());
+        // A cached-listing entry is a live proxy-cache object, so its
+        // freshness timestamp is exactly when it was cached; the sidecar
+        // projection carries no expiry. (Asserting these guards the
+        // #1542/#1567 field-collision regression that broke the build.)
+        assert_eq!(resp.cache_cached_at, Some(entry.cached_at));
+        assert!(resp.cache_expires_at.is_none());
         // Same repo_key + path always yields the same id.
         let resp2 = build_cached_artifact_response(&entry, "npm-remote");
         assert_eq!(resp.id, resp2.id);
